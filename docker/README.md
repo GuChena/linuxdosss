@@ -37,7 +37,45 @@ docker-compose logs -f
 | `CHROME_USER_DATA` | ❌ | /app/chrome-data | Chrome 用户数据目录，默认已持久化 |
 | `MEMORY_LIMIT` | ❌ | 1G | 内存限制 |
 | `CPU_LIMIT` | ❌ | 1.0 | CPU 限制 |
+| `MANUAL_CONTAINER_NAME` | ❌ | linuxdo-manual-login | 手动登录容器名称 |
+| `NOVNC_BIND` | ❌ | 127.0.0.1 | noVNC 监听地址，默认仅本机访问 |
+| `NOVNC_PORT` | ❌ | 6080 | noVNC 端口 |
+| `MANUAL_LOGIN_URL` | ❌ | https://linux.do/login | 手动登录时打开的地址 |
+| `SCREEN_WIDTH` | ❌ | 1280 | 手动登录浏览器宽度 |
+| `SCREEN_HEIGHT` | ❌ | 800 | 手动登录浏览器高度 |
+| `SHM_SIZE` | ❌ | 1gb | 手动登录容器共享内存大小 |
 | `DEBUG` | ❌ | 留空 | 填 `1` 可开启调试日志 |
+
+### 首次登录 / 滑块验证
+
+如果服务器首次登录时出现滑块、点选等验证，先用手动登录容器完成一次真人验证。它会和自动任务共用 `chrome-data`，登录状态会保留下来。
+
+```bash
+# 1. 停止自动任务，避免 Chrome 配置目录被两个容器同时占用
+docker compose down
+
+# 2. 启动手动登录容器
+docker compose -f docker-compose.manual.yml up -d --build
+
+# 3. 建议在本机开 SSH 隧道访问 noVNC
+ssh -L 6080:127.0.0.1:6080 root@你的服务器IP
+
+# 4. 在本机浏览器打开
+# http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale
+```
+
+在 noVNC 页面里手动登录 Linux.do 并完成滑块验证。确认登录成功后：
+
+```bash
+# 停止手动登录容器
+docker compose -f docker-compose.manual.yml down
+
+# 启动自动任务
+docker compose up -d --build
+docker compose logs -f
+```
+
+如果不想用 SSH 隧道，可以把 `.env` 里的 `NOVNC_BIND=127.0.0.1` 改成 `NOVNC_BIND=0.0.0.0`，然后访问 `http://服务器IP:6080/vnc.html?autoconnect=true&resize=scale`。这样会把无密码远程桌面暴露到公网，不建议长期打开。
 
 ### 运行机制
 

@@ -1,0 +1,37 @@
+# ============================================================================
+# Manual login helper
+# ============================================================================
+#
+# Use this only when Linux.do asks for a slider/captcha during first login.
+# It starts a visible Chrome session over noVNC and shares the same chrome-data
+# volume as the normal bot container.
+#
+# Recommended access:
+#   ssh -L 6080:127.0.0.1:6080 root@your-server
+#   open http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale
+#
+# Stop the normal bot before using this helper to avoid Chrome profile locks.
+# ============================================================================
+
+services:
+  manual-login:
+    build:
+      context: .
+      dockerfile: Dockerfile.manual
+    container_name: ${MANUAL_CONTAINER_NAME:-linuxdo-manual-login}
+    restart: unless-stopped
+    env_file: .env
+    shm_size: ${SHM_SIZE:-1gb}
+    ports:
+      - "${NOVNC_BIND:-127.0.0.1}:${NOVNC_PORT:-6080}:6080"
+    volumes:
+      - chrome-data:/app/chrome-data
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - CHROME_USER_DATA=${CHROME_USER_DATA:-/app/chrome-data}
+      - MANUAL_LOGIN_URL=${MANUAL_LOGIN_URL:-https://linux.do/login}
+      - SCREEN_WIDTH=${SCREEN_WIDTH:-1280}
+      - SCREEN_HEIGHT=${SCREEN_HEIGHT:-800}
+
+volumes:
+  chrome-data:

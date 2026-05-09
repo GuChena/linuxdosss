@@ -1,0 +1,26 @@
+FROM python:3.11-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Chrome plus a minimal X11/noVNC desktop for one-time manual login.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget gnupg fonts-wqy-zenhei fonts-noto-cjk \
+    xvfb x11vnc fluxbox novnc websockify dbus-x11 procps \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+        | gpg --dearmor -o /etc/apt/keyrings/google-linux-signing-key.gpg \
+    && chmod a+r /etc/apt/keyrings/google-linux-signing-key.gpg \
+    && printf '%s\n' \
+        'deb [arch=amd64 signed-by=/etc/apt/keyrings/google-linux-signing-key.gpg] https://dl.google.com/linux/chrome/deb/ stable main' \
+        > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-chrome-stable \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/start-manual-login.sh /usr/local/bin/start-manual-login
+RUN chmod +x /usr/local/bin/start-manual-login
+
+EXPOSE 6080
+
+ENTRYPOINT ["start-manual-login"]
