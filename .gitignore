@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Logs
+*.log
+
+# Environment / secrets (keep example templates tracked)
+.env
+.env*
+*.env
+docker/.env
+!*.env.example
+!**/.env.example
+
+# Local files
+*.json
+*.txt
+*.html
+*.png
+*.pyw
+nul
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# Browser data (for test scripts)
+browser_data/
+
+# Other scripts (keep only main files)
+linux_do_analyzer*.py
+linux_do_bot.py
+linux_do_browse*.py
+linux_do_deep*.py
+linux_do_full*.py
+linux_do_topic*.py
+linux_do_gui_part*.py
+LDStatusPro/
+
+# Dist folder (exe files are too large for git)
+dist/
