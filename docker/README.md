@@ -27,11 +27,15 @@ docker-compose logs -f
 |------|------|--------|------|
 | `LINUXDO_USERNAME` | ✅ | 留空后自行填写 | Linux.do 用户名 |
 | `LINUXDO_PASSWORD` | ✅ | 留空后自行填写 | Linux.do 密码 |
-| `RUNS_PER_DAY` | ❌ | 1 | 每天运行次数，稳定后最多建议 2 |
-| `TOPICS_MIN` | ❌ | 8 | 每次最少浏览帖子数 |
-| `TOPICS_MAX` | ❌ | 18 | 每次最多浏览帖子数 |
-| `LIKE_RATE` | ❌ | 0 | 点赞概率 (0-100)，建议 0-10 |
-| `RUN_ON_START` | ❌ | true | 启动时是否立即运行一次 |
+| `RUN_MODE` | ❌ | endless | 运行模式：`endless` 无尽、`schedule` 定时、`once` 单次 |
+| `BROWSE_MODE` | ❌ | deep | 浏览模式：`deep` 深度爬楼、`quick` 轻度速览 |
+| `ENABLE_LIKE` | ❌ | false | 是否启用自动点赞 |
+| `ENABLE_REPLY` | ❌ | false | 是否启用自动回复；Docker 版暂不支持回复 |
+| `LIKE_RATE` | ❌ | 0 | 点赞概率 (0-100)，`ENABLE_LIKE=false` 时不生效 |
+| `RUN_ON_START` | ❌ | true | `schedule` 模式启动时是否立即运行一次 |
+| `RUNS_PER_DAY` | ❌ | 1 | `schedule` 模式每天运行次数 |
+| `TOPICS_MIN` | ❌ | 8 | `schedule` / `once` 模式每次最少浏览帖子数 |
+| `TOPICS_MAX` | ❌ | 18 | `schedule` / `once` 模式每次最多浏览帖子数 |
 | `CONTAINER_NAME` | ❌ | linuxdo-bot | 容器名称 |
 | `TZ` | ❌ | Asia/Shanghai | 容器时区 |
 | `CHROME_USER_DATA` | ❌ | /app/chrome-data | Chrome 用户数据目录，默认已持久化 |
@@ -77,11 +81,38 @@ docker compose logs -f
 
 如果不想用 SSH 隧道，可以把 `.env` 里的 `NOVNC_BIND=127.0.0.1` 改成 `NOVNC_BIND=0.0.0.0`，然后访问 `http://服务器IP:6080/vnc.html?autoconnect=true&resize=scale`。这样会把无密码远程桌面暴露到公网，不建议长期打开。
 
+### 推荐无尽深度爬楼配置
+
+如果只想让服务器一直深度爬楼、不点赞、不回复，`.env` 保持下面这样即可：
+
+```env
+RUN_MODE=endless
+BROWSE_MODE=deep
+ENABLE_LIKE=false
+ENABLE_REPLY=false
+
+RUN_ON_START=true
+CONTAINER_NAME=linuxdo-bot
+TZ=Asia/Shanghai
+CHROME_USER_DATA=/app/chrome-data
+MEMORY_LIMIT=1G
+CPU_LIMIT=1.0
+DEBUG=
+```
+
+停止无尽模式：
+
+```bash
+docker compose down
+```
+
 ### 运行机制
 
-- 启动后立即执行一次浏览任务
-- 之后每天在 7:00-23:00 之间随机选择时间运行
-- 每次运行时间、浏览数量、点赞都是随机的
+- `RUN_MODE=endless`：启动后持续浏览，不自动停止，直到手动 `docker compose down`
+- `RUN_MODE=schedule`：启动后按 `RUNS_PER_DAY` 在 7:00-23:00 之间随机定时运行
+- `RUN_MODE=once` 或 `docker compose run --rm linuxdo --once`：只运行一次
+- `BROWSE_MODE=deep`：每个帖子尽量按楼层计数器深度爬到末楼
+- `BROWSE_MODE=quick`：每个帖子只随机滚动 3-8 次
 - 浏览器数据持久化，登录状态会保持
 
 ### 常用命令

@@ -12,6 +12,7 @@ import json
 import signal
 import argparse
 import schedule
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 try:
@@ -41,6 +42,89 @@ CATEGORIES = [
 ]
 
 BASE_URL = "https://linux.do"
+
+
+@dataclass
+class RuntimeConfig:
+    username: str
+    password: str
+    run_mode: str
+    browse_mode: str
+    enable_like: bool
+    enable_reply: bool
+    like_rate: float
+    runs_per_day: int
+    topics_min: int
+    topics_max: int
+
+
+def parse_bool(value, default=False):
+    """Parse common env-style boolean values."""
+    if value is None or value == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _arg_or_env(arg_value, env, name, default=None):
+    return arg_value if arg_value is not None else env.get(name, default)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Linux.do 自动刷帖 Docker 版")
+    parser.add_argument("-u", "--username", help="用户名")
+    parser.add_argument("-p", "--password", help="密码")
+    parser.add_argument(
+        "--run-mode",
+        choices=["schedule", "endless", "once"],
+        help="运行模式：schedule 定时、endless 无尽、once 单次",
+    )
+    parser.add_argument(
+        "--browse-mode",
+        choices=["quick", "deep"],
+        help="浏览模式：quick 轻度滚动、deep 深度爬楼",
+    )
+    parser.add_argument("--enable-like", choices=["true", "false"], help="是否点赞")
+    parser.add_argument("--enable-reply", choices=["true", "false"], help="是否回复")
+    parser.add_argument("--like-rate", type=int, help="点赞概率 0-100")
+    parser.add_argument("--runs-per-day", type=int, help="每天运行次数")
+    parser.add_argument("--topics-min", type=int, help="每次最少浏览帖子数")
+    parser.add_argument("--topics-max", type=int, help="每次最多浏览帖子数")
+    parser.add_argument("--once", action="store_true", help="只运行一次，不启动调度器")
+    parser.add_argument("--debug", action="store_true", help="调试模式")
+    return parser
+
+
+def load_runtime_config(args, env=os.environ):
+    run_mode = _arg_or_env(args.run_mode, env, "RUN_MODE", "schedule")
+    if args.once:
+        run_mode = "once"
+
+    browse_mode = _arg_or_env(args.browse_mode, env, "BROWSE_MODE", "quick")
+    enable_like = parse_bool(
+        _arg_or_env(args.enable_like, env, "ENABLE_LIKE", None), default=True
+    )
+    enable_reply = parse_bool(
+        _arg_or_env(args.enable_reply, env, "ENABLE_REPLY", None), default=False
+    )
+    like_rate_percent = int(_arg_or_env(args.like_rate, env, "LIKE_RATE", "30"))
+    if not enable_like:
+        like_rate_percent = 0
+
+    topics_min = int(_arg_or_env(args.topics_min, env, "TOPICS_MIN", "15"))
+    topics_max = int(_arg_or_env(args.topics_max, env, "TOPICS_MAX", "40"))
+
+    return RuntimeConfig(
+        username=args.username or env.get("LINUXDO_USERNAME"),
+        password=args.password or env.get("LINUXDO_PASSWORD"),
+        run_mode=run_mode,
+        browse_mode=browse_mode,
+        enable_like=enable_like,
+        enable_reply=enable_reply,
+        like_rate=like_rate_percent / 100,
+        runs_per_day=int(_arg_or_env(args.runs_per_day, env, "RUNS_PER_DAY", "2")),
+        topics_min=topics_min,
+        topics_max=topics_max,
+    )
 
 
 # ============================================================================
@@ -81,12 +165,17 @@ class Log:
 
 
 class LinuxDoBot:
-    def __init__(self, username, password, like_rate=0.3):
+    def __init__(
+        self, username, password, like_rate=0.3, browse_mode="quick", enable_like=True
+    ):
         self.username = username
         self.password = password
         self.like_rate = like_rate
+        self.browse_mode = browse_mode
+        self.enable_like = enable_like
         self.page = None
-        self.stats = {"topics": 0, "likes": 0, "scrolls": 0}
+        self.running = True
+        self.stats = {"topics": 0, "likes": 0, "scrolls": 0, "floors": 0}
 
     def _delay(self, lo=1.0, hi=3.0, reason=""):
         t = random.uniform(lo, hi)
@@ -204,6 +293,142 @@ class LinuxDoBot:
             Log.err(f"获取帖子失败: {e}")
             return []
 
+    def get_floor_info(self):
+        """获取当前帖子楼层信息。"""
+        try:
+            return self.page.run_js("""
+            function getFloorInfo() {
+                const timelineElement = document.querySelector('.timeline-replies');
+                if (timelineElement) {
+                    const text = timelineElement.textContent.trim();
+                    const match = text.match(/(\\d+)\\s*\\/\\s*(\\d+)/);
+                    if (match) {
+                        return {
+                            current: parseInt(match[1]),
+                            total: parseInt(match[2]),
+                            source: 'timeline-replies'
+                        };
+                    }
+                }
+
+                const progressElement = document.querySelector('#topic-progress .nums');
+                if (progressElement) {
+                    const spans = progressElement.querySelectorAll('span');
+                    if (spans.length >= 3) {
+                        const current = parseInt(spans[0].textContent);
+                        const total = parseInt(spans[2].textContent);
+                        if (!isNaN(current) && !isNaN(total)) {
+                            return {
+                                current: current,
+                                total: total,
+                                source: 'topic-progress'
+                            };
+                        }
+                    }
+                }
+
+                return null;
+            }
+            return getFloorInfo();
+            """)
+        except Exception:
+            return None
+
+    def _scroll_topic_quick(self):
+        """轻度浏览：随机滚动 3-8 次。"""
+        scrolls = random.randint(3, 8)
+        actual_scrolls = 0
+        for i in range(scrolls):
+            if not self.running:
+                break
+            dist = random.randint(300, 800)
+            self.page.run_js(f"window.scrollBy(0, {dist})")
+            actual_scrolls += 1
+            self._delay(1.5, 3.5, f"滚动 {i + 1}/{scrolls}")
+            if self.page.run_js(
+                "return (window.innerHeight + window.scrollY) >= document.body.offsetHeight - 100"
+            ):
+                break
+        return actual_scrolls
+
+    def _scroll_topic_deep(self):
+        """深度爬楼：优先按楼层计数器滚到末楼，失败则滚到底。"""
+        floor_info = self.get_floor_info()
+        scroll_count = 0
+        max_scrolls = 200
+
+        if floor_info and floor_info.get("total"):
+            total_floor = floor_info["total"]
+            current_floor = floor_info.get("current", 1)
+            last_floor = current_floor
+            stuck_count = 0
+            Log.info(
+                f"深度爬楼: 当前 {current_floor}/{total_floor} 楼 "
+                f"(来源: {floor_info.get('source', 'unknown')})"
+            )
+
+            while (
+                self.running
+                and current_floor < total_floor
+                and scroll_count < max_scrolls
+            ):
+                self._delay(2, 4, "阅读")
+                dist = random.randint(600, 1200)
+                self.page.run_js(f"window.scrollBy(0, {dist})")
+                scroll_count += 1
+                time.sleep(0.5)
+
+                floor_info = self.get_floor_info()
+                if not floor_info:
+                    continue
+
+                current_floor = floor_info.get("current", current_floor)
+                if current_floor > last_floor:
+                    floors_read = current_floor - last_floor
+                    self.stats["floors"] += floors_read
+                    last_floor = current_floor
+                    stuck_count = 0
+                    Log.info(f"爬楼 #{scroll_count}: {current_floor}/{total_floor}")
+                else:
+                    stuck_count += 1
+                    if stuck_count >= 3:
+                        Log.debug("楼层未变化，增加滚动距离")
+                        self.page.run_js("window.scrollBy(0, 1500)")
+                        time.sleep(1)
+                        stuck_count = 0
+
+            Log.info(f"深度爬楼完成: {current_floor}/{total_floor} 楼")
+            return scroll_count
+
+        Log.warn("无法获取楼层信息，使用滚到底模式")
+        stable_bottom_count = 0
+        last_height = 0
+        while self.running and scroll_count < max_scrolls:
+            self._delay(2, 4, "阅读")
+            dist = random.randint(600, 1200)
+            self.page.run_js(f"window.scrollBy(0, {dist})")
+            scroll_count += 1
+            time.sleep(0.5)
+
+            page_state = self.page.run_js("""
+            return {
+                atBottom: (window.innerHeight + window.scrollY) >= document.body.scrollHeight - 100,
+                height: document.body.scrollHeight
+            };
+            """) or {}
+            height = page_state.get("height", 0)
+            if page_state.get("atBottom") and height == last_height:
+                stable_bottom_count += 1
+            else:
+                stable_bottom_count = 0
+            last_height = height
+
+            if stable_bottom_count >= 2:
+                break
+
+        Log.info(f"滚到底模式完成: 滚动 {scroll_count} 次")
+        return scroll_count
+
     def browse_topic(self, topic):
         """浏览帖子"""
         url = topic["url"]
@@ -215,22 +440,16 @@ class LinuxDoBot:
             self.page.get(url)
             self._delay(2, 3)
 
-            # 随机滚动
-            scrolls = random.randint(3, 8)
-            for i in range(scrolls):
-                dist = random.randint(300, 800)
-                self.page.run_js(f"window.scrollBy(0, {dist})")
-                self._delay(1.5, 3.5, f"滚动 {i + 1}/{scrolls}")
-                if self.page.run_js(
-                    "return (window.innerHeight + window.scrollY) >= document.body.offsetHeight - 100"
-                ):
-                    break
+            if self.browse_mode == "deep":
+                scrolls = self._scroll_topic_deep()
+            else:
+                scrolls = self._scroll_topic_quick()
 
             self.stats["topics"] += 1
             self.stats["scrolls"] += scrolls
 
             # 随机点赞
-            if random.random() < self.like_rate:
+            if self.enable_like and random.random() < self.like_rate:
                 self._try_like()
 
             return True
@@ -265,7 +484,8 @@ class LinuxDoBot:
         Log.info(f"开始浏览任务 | 目标: {target_topics} 个帖子")
         Log.info("=" * 50)
 
-        self.stats = {"topics": 0, "likes": 0, "scrolls": 0}
+        self.running = True
+        self.stats = {"topics": 0, "likes": 0, "scrolls": 0, "floors": 0}
         start = time.time()
 
         try:
@@ -277,9 +497,9 @@ class LinuxDoBot:
             cats = CATEGORIES.copy()
             random.shuffle(cats)
 
-            while self.stats["topics"] < target_topics:
+            while self.running and self.stats["topics"] < target_topics:
                 for cat in cats:
-                    if self.stats["topics"] >= target_topics:
+                    if not self.running or self.stats["topics"] >= target_topics:
                         break
                     topics = self.get_topics(cat)
                     if not topics:
@@ -288,7 +508,7 @@ class LinuxDoBot:
                         topics, min(random.randint(2, 5), len(topics))
                     )
                     for t in selected:
-                        if self.stats["topics"] >= target_topics:
+                        if not self.running or self.stats["topics"] >= target_topics:
                             break
                         self.browse_topic(t)
                         self._delay(reason="切换帖子")
@@ -310,9 +530,75 @@ class LinuxDoBot:
         Log.info("=" * 50)
         Log.ok(f"任务完成 | 用时 {elapsed // 60}分{elapsed % 60}秒")
         Log.ok(
-            f"浏览 {self.stats['topics']} | 点赞 {self.stats['likes']} | 滚动 {self.stats['scrolls']}"
+            f"浏览 {self.stats['topics']} | 爬楼 {self.stats['floors']} | "
+            f"点赞 {self.stats['likes']} | 滚动 {self.stats['scrolls']}"
         )
         Log.info("=" * 50)
+
+    def run_endless(self):
+        """无尽模式：持续深度/轻度浏览，直到容器收到停止信号。"""
+        Log.info("=" * 50)
+        Log.info("开始无尽模式")
+        Log.info(f"浏览模式: {'深度爬楼' if self.browse_mode == 'deep' else '轻度浏览'}")
+        Log.info(f"自动点赞: {'开启' if self.enable_like else '关闭'}")
+        Log.info("=" * 50)
+
+        self.running = True
+        self.stats = {"topics": 0, "likes": 0, "scrolls": 0, "floors": 0}
+        start = time.time()
+
+        try:
+            if not self.start_browser():
+                return
+            if not self.login():
+                return
+
+            cats = CATEGORIES.copy()
+            random.shuffle(cats)
+
+            while self.running:
+                for cat in cats:
+                    if not self.running:
+                        break
+                    topics = self.get_topics(cat)
+                    if not topics:
+                        continue
+                    selected = random.sample(
+                        topics, min(random.randint(2, 5), len(topics))
+                    )
+                    for t in selected:
+                        if not self.running:
+                            break
+                        self.browse_topic(t)
+                        if self.running:
+                            self._delay(reason="切换帖子")
+                random.shuffle(cats)
+                if self.running:
+                    Log.info("继续下一轮无尽浏览...")
+
+        except KeyboardInterrupt:
+            Log.warn("用户中断")
+        except Exception as e:
+            Log.err(f"运行出错: {e}")
+        finally:
+            if self.page:
+                try:
+                    self.page.quit()
+                except:
+                    pass
+                self.page = None
+
+        elapsed = int(time.time() - start)
+        Log.info("=" * 50)
+        Log.ok(f"无尽模式停止 | 用时 {elapsed // 60}分{elapsed % 60}秒")
+        Log.ok(
+            f"浏览 {self.stats['topics']} | 爬楼 {self.stats['floors']} | "
+            f"点赞 {self.stats['likes']} | 滚动 {self.stats['scrolls']}"
+        )
+        Log.info("=" * 50)
+
+    def stop(self):
+        self.running = False
 
 
 # ============================================================================
@@ -428,60 +714,52 @@ class RandomScheduler:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Linux.do 自动刷帖 Docker 版")
-    parser.add_argument("-u", "--username", help="用户名")
-    parser.add_argument("-p", "--password", help="密码")
-    parser.add_argument(
-        "--like-rate", type=int, default=30, help="点赞概率 0-100，默认 30"
-    )
-    parser.add_argument(
-        "--runs-per-day", type=int, default=2, help="每天运行次数，默认 2"
-    )
-    parser.add_argument(
-        "--topics-min", type=int, default=15, help="每次最少浏览帖子数，默认 15"
-    )
-    parser.add_argument(
-        "--topics-max", type=int, default=40, help="每次最多浏览帖子数，默认 40"
-    )
-    parser.add_argument("--once", action="store_true", help="只运行一次，不启动调度器")
-    parser.add_argument("--debug", action="store_true", help="调试模式")
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.debug:
         os.environ["DEBUG"] = "1"
 
-    username = args.username or os.environ.get("LINUXDO_USERNAME")
-    password = args.password or os.environ.get("LINUXDO_PASSWORD")
+    config = load_runtime_config(args)
 
-    if not username or not password:
+    if not config.username or not config.password:
         print("错误: 请提供用户名和密码")
         print("  环境变量: LINUXDO_USERNAME / LINUXDO_PASSWORD")
         print("  命令行:   -u 用户名 -p 密码")
         sys.exit(1)
 
-    like_rate = int(args.like_rate or os.environ.get("LIKE_RATE", "30"))
-    runs_per_day = int(args.runs_per_day or os.environ.get("RUNS_PER_DAY", "2"))
-    topics_min = int(args.topics_min or os.environ.get("TOPICS_MIN", "15"))
-    topics_max = int(args.topics_max or os.environ.get("TOPICS_MAX", "40"))
+    if config.enable_reply:
+        Log.warn("Docker 版暂不支持自动回复，已忽略 ENABLE_REPLY=true")
 
     bot = LinuxDoBot(
-        username=username,
-        password=password,
-        like_rate=like_rate / 100,
+        username=config.username,
+        password=config.password,
+        like_rate=config.like_rate,
+        browse_mode=config.browse_mode,
+        enable_like=config.enable_like,
     )
 
-    if args.once:
-        topics = random.randint(topics_min, topics_max)
+    if config.run_mode == "once":
+        topics = random.randint(config.topics_min, config.topics_max)
         bot.run_once(target_topics=topics)
+    elif config.run_mode == "endless":
+        def handle_signal(sig, frame):
+            Log.info("收到停止信号，正在退出...")
+            bot.stop()
+
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+        bot.run_endless()
     else:
         scheduler = RandomScheduler(
             bot,
-            runs_per_day=runs_per_day,
-            topics_range=(topics_min, topics_max),
+            runs_per_day=config.runs_per_day,
+            topics_range=(config.topics_min, config.topics_max),
         )
 
         def handle_signal(sig, frame):
             Log.info("收到停止信号，正在退出...")
+            bot.stop()
             scheduler.stop()
 
         signal.signal(signal.SIGTERM, handle_signal)
