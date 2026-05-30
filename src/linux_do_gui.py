@@ -1629,6 +1629,9 @@ class GUI:
         # 应用上次保存的配置
         s._apply_settings(s._load_settings())
 
+        # 任何配置变化即时落盘（在应用已保存配置之后挂载，避免恢复时反复写盘）
+        s._install_autosave()
+
         # 窗口居中
         s._center_window()
 
@@ -1700,12 +1703,23 @@ class GUI:
         return data
 
     def _save_settings(s):
-        """把当前 UI 配置写入磁盘"""
+        """把当前 UI 配置写入磁盘（原子写，避免写到一半被中断而损坏）"""
         try:
-            with open(get_settings_path(), "w", encoding="utf-8") as f:
+            path = get_settings_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(s._collect_settings(), f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
         except Exception:
             pass
+
+    def _install_autosave(s):
+        """给所有配置控件挂上「变化即保存」回调，避免依赖开始/关闭时机"""
+        for var in s._settings_var_map().values():
+            try:
+                var.trace_add("write", lambda *a: s._save_settings())
+            except Exception:
+                pass
 
     def _check_update(s):
         """检查版本更新"""
@@ -1884,6 +1898,7 @@ class GUI:
 
     def _on_close_window(s):
         """窗口关闭按钮处理 - 最小化到托盘"""
+        s._save_settings()
         if TRAY_SUPPORT and s.tray_icon:
             s.rt.withdraw()  # 隐藏窗口
         else:
@@ -2482,6 +2497,7 @@ class GUI:
             if cat["n"] == name:
                 cat["e"] = var.get()
                 break
+        s._save_settings()
 
     def _on_reply_toggle(s):
         """自动回复开关切换时的处理"""
