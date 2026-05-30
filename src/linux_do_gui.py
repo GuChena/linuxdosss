@@ -92,6 +92,11 @@ def get_icon_path():
         return os.path.join(project_root, "assets", "icon.ico")
 
 
+def get_settings_path():
+    """配置文件路径（与 browser_data 同目录，工作目录下）"""
+    return os.path.join(os.getcwd(), "settings.json")
+
+
 def create_tray_image(color="#0f3460"):
     """创建托盘图标图像"""
     size = 64
@@ -1621,6 +1626,9 @@ class GUI:
 
         s._ui()
 
+        # 应用上次保存的配置
+        s._apply_settings(s._load_settings())
+
         # 窗口居中
         s._center_window()
 
@@ -1633,6 +1641,71 @@ class GUI:
 
         # 启动后检查更新（延迟执行，避免阻塞UI）
         s.rt.after(1000, s._check_update)
+
+    def _settings_var_map(s):
+        """配置项 -> 对应的 Tk 变量（UI 原始值，读写对称）"""
+        return {
+            "mode": s.mode_var,
+            "topics": s.topics_var,
+            "time": s.time_var,
+            "browse_mode": s.browse_mode_var,
+            "proxy": s.proxy_var,
+            "enable_like": s.enable_like_var,
+            "like": s.like_var,
+            "enable_reply": s.enable_reply_var,
+            "reply": s.reply_var,
+            "enable_wait": s.enable_wait_var,
+            "wait": s.wait_var,
+            "reply_count_min": s.reply_count_min_var,
+            "reply_count_max": s.reply_count_max_var,
+            "unread_only": s.unread_only_var,
+            "list_scroll": s.list_scroll_var,
+        }
+
+    def _load_settings(s):
+        """从磁盘读取配置；文件不存在或损坏时返回空字典"""
+        try:
+            with open(get_settings_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _apply_settings(s, data):
+        """把读到的配置应用到 UI 控件（须在 _ui 之后调用）"""
+        if not data:
+            return
+        for key, var in s._settings_var_map().items():
+            if key in data:
+                try:
+                    var.set(data[key])
+                except Exception:
+                    pass
+        cats = data.get("cats")
+        if isinstance(cats, dict):
+            for cat in s.cats:
+                if cat["n"] in cats:
+                    cat["e"] = bool(cats[cat["n"]])
+                    if cat["n"] in s.cat_vars:
+                        s.cat_vars[cat["n"]].set(cat["e"])
+
+    def _collect_settings(s):
+        """收集当前 UI 控件的值，用于写盘"""
+        data = {key: var.get() for key, var in s._settings_var_map().items()}
+        data["cats"] = {
+            cat["n"]: bool(s.cat_vars[cat["n"]].get())
+            for cat in s.cats
+            if cat["n"] in s.cat_vars
+        }
+        return data
+
+    def _save_settings(s):
+        """把当前 UI 配置写入磁盘"""
+        try:
+            with open(get_settings_path(), "w", encoding="utf-8") as f:
+                json.dump(s._collect_settings(), f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _check_update(s):
         """检查版本更新"""
@@ -1851,6 +1924,7 @@ class GUI:
 
     def _close(s):
         """关闭窗口"""
+        s._save_settings()
         if s.bot:
             s.bot.stop()
         if s.tray_icon:
@@ -2664,6 +2738,9 @@ class GUI:
             list_scroll_times = 3
         s.cfg["list_scroll_times"] = list_scroll_times
         s.list_scroll_var.set(str(list_scroll_times))
+
+        # 持久化当前配置，供下次启动恢复
+        s._save_settings()
 
         s.start_btn.config(state=tk.DISABLED)
         s.stop_btn.config(state=tk.NORMAL)
