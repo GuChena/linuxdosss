@@ -5,8 +5,8 @@ title Linux.do Helper Launcher
 
 cd /d "%~dp0"
 
-if not exist "linux_do_gui.py" (
-    echo [ERROR] linux_do_gui.py was not found.
+if not exist "src\linux_do_gui.py" (
+    echo [ERROR] src\linux_do_gui.py was not found.
     echo Project directory: "%CD%"
     echo Please put start.bat in the project root directory.
     pause
@@ -62,7 +62,7 @@ if errorlevel 1 (
 )
 
 echo [4/4] Starting GUI...
-"%VENV_PY%" "linux_do_gui.py"
+"%VENV_PY%" "src\linux_do_gui.py"
 set "APP_EXIT=%ERRORLEVEL%"
 if not "%APP_EXIT%"=="0" (
     echo [ERROR] Application exited with code %APP_EXIT%.

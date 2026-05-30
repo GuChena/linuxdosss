@@ -63,8 +63,10 @@ jobs:
             --hidden-import PIL `
             --hidden-import PIL.Image `
             --hidden-import PIL.ImageDraw `
+            --add-data "assets/icon.ico;." `
+            --icon "assets/icon.ico" `
             --clean --noconfirm `
-            linux_do_gui.py
+            src/linux_do_gui.py
 
       - name: Build with PyInstaller (Linux/macOS)
         if: matrix.platform != 'Windows'
@@ -78,8 +80,9 @@ jobs:
             --hidden-import PIL \
             --hidden-import PIL.Image \
             --hidden-import PIL.ImageDraw \
+            --add-data "assets/icon.ico:." \
             --clean --noconfirm \
-            linux_do_gui.py
+            src/linux_do_gui.py
 
       - name: Package macOS app as DMG
         if: matrix.platform == 'macOS-ARM'

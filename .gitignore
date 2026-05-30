@@ -26,16 +26,17 @@ wheels/
 *.log
 
 # Environment / secrets (keep example templates tracked)
+.venv/
 .env
 .env*
 *.env
-docker/.env
 !*.env.example
 !**/.env.example
 
 # Local files
 *.json
 *.txt
+!requirements.txt
 *.html
 *.png
 *.pyw
@@ -50,7 +51,7 @@ nul
 # Claude
 .claude/
 
-# Browser data (for test scripts)
+# Browser data
 browser_data/
 
 # Other scripts (keep only main files)

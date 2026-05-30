@@ -85,10 +85,11 @@ def get_icon_path():
     if getattr(sys, "frozen", False):
         # 打包后的路径
         base_path = sys._MEIPASS
+        return os.path.join(base_path, "icon.ico")
     else:
         # 开发环境路径
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_path, "icon.ico")
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(project_root, "assets", "icon.ico")
 
 
 def create_tray_image(color="#0f3460"):
@@ -146,6 +147,11 @@ CFG = {
     "like_rate": 0.3,
     "reply_rate": 0.05,
     "like_reply_rate": 0.15,
+    "reply_count_min": 0,
+    "reply_count_max": 120,
+    "unread_only": True,
+    "list_scroll_times": 3,
+    "topic_candidate_target": 8,
     "scroll_time": 3,
     "wait_min": 1,
     "wait_max": 3,
@@ -225,6 +231,176 @@ CFG = {
         "茅塞顿开，感谢楼主",
     ],
 }
+
+
+def parse_reply_count_range(
+    min_text, max_text, default_min=0, default_max=120
+):
+    """Parse inclusive reply-count bounds from GUI entry text."""
+
+    def parse_bound(value, allow_blank=False):
+        text = "" if value is None else str(value).strip()
+        if text == "":
+            return None if allow_blank else default_min
+        count = int(text.replace(",", ""))
+        if count < 0:
+            raise ValueError("reply count cannot be negative")
+        return count
+
+    try:
+        reply_min = parse_bound(min_text)
+        reply_max = parse_bound(max_text, allow_blank=True)
+        if reply_max is not None and reply_min > reply_max:
+            raise ValueError("reply count min cannot exceed max")
+        return reply_min, reply_max
+    except Exception:
+        return default_min, default_max
+
+
+def filter_topics_by_reply_count(topics, reply_min=0, reply_max=120):
+    """Keep topics whose replyCount is inside the inclusive range."""
+    filtered = []
+    for topic in topics or []:
+        reply_count = topic.get("replyCount")
+        if reply_count is None:
+            continue
+        try:
+            reply_count = int(reply_count)
+        except (TypeError, ValueError):
+            continue
+        if reply_count < reply_min:
+            continue
+        if reply_max is not None and reply_count > reply_max:
+            continue
+        filtered.append(topic)
+    return filtered
+
+
+def select_topic_candidates(
+    topics_payload, reply_min=0, reply_max=120, unread_only=False
+):
+    """Filter by reply count, then keep existing unread-first fallback behavior."""
+    unread = filter_topics_by_reply_count(
+        (topics_payload or {}).get("unread", []), reply_min, reply_max
+    )
+    read = filter_topics_by_reply_count(
+        (topics_payload or {}).get("read", []), reply_min, reply_max
+    )
+
+    if unread_only:
+        return unread
+
+    if unread:
+        if len(unread) < 3 and read:
+            return unread + read[:3]
+        return unread
+    return read
+
+
+def _topic_key(topic):
+    return str(topic.get("id") or topic.get("url") or topic.get("title") or "")
+
+
+def merge_topic_payloads(existing, incoming):
+    """Merge topic payloads from repeated list scans, preserving first-seen order."""
+    merged = {"unread": [], "read": [], "all": []}
+    seen = set()
+
+    for payload in (existing or {}, incoming or {}):
+        for bucket in ("unread", "read"):
+            for topic in payload.get(bucket, []) or []:
+                key = _topic_key(topic)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                merged[bucket].append(topic)
+
+    merged["all"] = merged["unread"] + merged["read"]
+    return merged
+
+
+def count_topic_candidates(topics_payload, reply_min=0, reply_max=120, unread_only=False):
+    return len(
+        select_topic_candidates(
+            topics_payload, reply_min, reply_max, unread_only=unread_only
+        )
+    )
+
+
+def build_get_topics_js():
+    """Build JS that reads topics and the list-page reply column."""
+    return """
+        function getTopics() {
+            function parseReplyCount(text) {
+                const normalized = String(text || '').trim().replace(/,/g, '');
+                const wanMatch = normalized.match(/([0-9]+(?:[.][0-9]+)?)\\s*万/);
+                if (wanMatch) {
+                    return Math.round(parseFloat(wanMatch[1]) * 10000);
+                }
+                const kMatch = normalized.match(/([0-9]+(?:[.][0-9]+)?)\\s*[kK]/);
+                if (kMatch) {
+                    return Math.round(parseFloat(kMatch[1]) * 1000);
+                }
+                const numMatch = normalized.match(/[0-9]+/);
+                return numMatch ? parseInt(numMatch[0], 10) : null;
+            }
+
+            function getReplyCount(row) {
+                const replyNode = row.querySelector(
+                    'td.num.posts-map.posts button, td.num.posts-map.posts'
+                );
+                if (!replyNode) {
+                    return null;
+                }
+                return parseReplyCount(replyNode.textContent);
+            }
+
+            const rows = document.querySelectorAll('tr.topic-list-item');
+            const unreadTopics = [];  // 未读话题（带小蓝点）
+            const readTopics = [];    // 已读话题（无小蓝点）
+
+            rows.forEach(row => {
+                const link = row.querySelector('a.title.raw-link.raw-topic-link, a.title');
+                if (link) {
+                    const href = link.getAttribute('href');
+                    const title = link.textContent.trim();
+                    const topicId = row.getAttribute('data-topic-id');
+                    const replyCount = getReplyCount(row);
+
+                    // 跳过置顶帖和无法识别回复数的话题。
+                    if (replyCount === null) {
+                        return;
+                    }
+
+                    if (href && title && !row.classList.contains('pinned')) {
+                        // 检查是否有小蓝点（未读标记）
+                        const newTopicBadge = row.querySelector('.badge.badge-notification.new-topic');
+
+                        const topicData = {
+                            url: href,
+                            title: title.substring(0, 50),
+                            id: topicId,
+                            isUnread: !!newTopicBadge,  // 是否未读
+                            replyCount: replyCount
+                        };
+
+                        if (newTopicBadge) {
+                            unreadTopics.push(topicData);
+                        } else {
+                            readTopics.push(topicData);
+                        }
+                    }
+                }
+            });
+
+            return {
+                unread: unreadTopics,
+                read: readTopics,
+                all: [...unreadTopics, ...readTopics]
+            };
+        }
+        return getTopics();
+        """
 
 
 class Bot:
@@ -560,97 +736,89 @@ class Bot:
         return None
 
     def get_topics(s, cat):
-        """使用JS获取帖子列表（按回复数排序）"""
+        """获取帖子列表，必要时下滑加载更多，再按回复数范围筛选。"""
         url = s.cfg["base"] + cat["u"]
         s.lg("进入板块: " + cat["n"])
         s.pg.get(url)
         s._random_delay(2, 4, "页面加载")
 
-        # 点击"回复"按钮进行排序
-        s.lg("点击'回复'按钮进行排序...")
-        clicked = s.pg.run_js("""
-        function clickRepliesSort() {
-            // 查找回复排序按钮
-            const replyButton = document.querySelector('th[data-sort-order="posts"] button');
-            if (replyButton) {
-                replyButton.click();
-                return true;
-            }
-            return false;
-        }
-        return clickRepliesSort();
-        """)
+        reply_min = s.cfg.get("reply_count_min", 0)
+        reply_max = s.cfg.get("reply_count_max", 120)
+        unread_only = s.cfg.get("unread_only", True)
+        list_scroll_times = max(0, int(s.cfg.get("list_scroll_times", 3)))
+        target_candidates = max(1, int(s.cfg.get("topic_candidate_target", 8)))
 
-        if clicked:
-            s.lg("已点击回复排序按钮")
-            time.sleep(2)  # 等待排序完成
-        else:
-            s.lg("未找到回复排序按钮，使用默认排序")
+        topics = {"unread": [], "read": [], "all": []}
+        previous_total = 0
 
-        # 使用JS获取帖子 - 优先获取未读话题（带小蓝点）
-        topics = s.pg.run_js("""
-        function getTopics() {
-            const rows = document.querySelectorAll('tr.topic-list-item');
-            const unreadTopics = [];  // 未读话题（带小蓝点）
-            const readTopics = [];    // 已读话题（无小蓝点）
+        for scan_index in range(list_scroll_times + 1):
+            current_topics = s.pg.run_js(build_get_topics_js()) or {}
+            topics = merge_topic_payloads(topics, current_topics)
+            total_loaded = len(topics.get("all", []))
+            candidate_count = count_topic_candidates(
+                topics, reply_min, reply_max, unread_only=unread_only
+            )
 
-            rows.forEach(row => {
-                const link = row.querySelector('a.title.raw-link.raw-topic-link');
-                if (link) {
-                    const href = link.getAttribute('href');
-                    const title = link.textContent.trim();
-                    const topicId = row.getAttribute('data-topic-id');
+            s.lg(
+                f"列表扫描 {scan_index + 1}/{list_scroll_times + 1}: "
+                f"已加载 {total_loaded} 个话题，符合条件 {candidate_count} 个"
+            )
 
-                    // 跳过置顶帖
-                    if (href && title && !row.classList.contains('pinned')) {
-                        // 检查是否有小蓝点（未读标记）
-                        const newTopicBadge = row.querySelector('.badge.badge-notification.new-topic');
+            if candidate_count >= target_candidates:
+                break
+            if scan_index >= list_scroll_times or not s.run:
+                break
+            if scan_index > 0 and total_loaded == previous_total:
+                s.lg("下滑后没有加载到更多话题，停止加载")
+                break
 
-                        const topicData = {
-                            url: href,
-                            title: title.substring(0, 50),
-                            id: topicId,
-                            isUnread: !!newTopicBadge  // 是否未读
-                        };
-
-                        if (newTopicBadge) {
-                            unreadTopics.push(topicData);
-                        } else {
-                            readTopics.push(topicData);
-                        }
-                    }
-                }
-            });
-
-            // 优先返回未读话题，如果没有未读的再返回已读的
-            return {
-                unread: unreadTopics,
-                read: readTopics,
-                all: [...unreadTopics, ...readTopics]
-            };
-        }
-        return getTopics();
-        """)
+            previous_total = total_loaded
+            s.lg("符合条件的话题不足，向下滑动列表加载更多...")
+            s.pg.run_js("window.scrollTo(0, document.body.scrollHeight)")
+            s._random_delay(1.5, 2.5, "等待列表加载更多")
 
         if topics:
             unread_count = len(topics.get("unread", []))
             read_count = len(topics.get("read", []))
             s.lg(f"找到 {unread_count} 个未读话题，{read_count} 个已读话题")
 
-            # 优先返回未读话题，如果未读话题少于3个，补充一些已读话题
-            unread = topics.get("unread", [])
-            read = topics.get("read", [])
+            max_label = "不限" if reply_max is None else str(reply_max)
+            filtered_unread = filter_topics_by_reply_count(
+                topics.get("unread", []), reply_min, reply_max
+            )
+            filtered_read = filter_topics_by_reply_count(
+                topics.get("read", []), reply_min, reply_max
+            )
+            s.lg(
+                f"回复数范围 {reply_min}-{max_label}，筛选后 "
+                f"{len(filtered_unread)} 个未读话题，{len(filtered_read)} 个已读话题"
+            )
 
-            if unread:
-                s.lg(f"优先浏览 {len(unread)} 个未读话题")
+            candidates = select_topic_candidates(
+                topics, reply_min, reply_max, unread_only=unread_only
+            )
+            if not candidates:
+                if unread_only:
+                    s.lg("只浏览未读已开启，没有符合回复数范围的未读话题，跳过该板块")
+                else:
+                    s.lg("没有符合回复数范围的帖子，跳过该板块")
+                return []
+
+            # 优先返回未读话题，如果未读话题少于3个，补充一些已读话题
+            if filtered_unread:
+                if unread_only:
+                    s.lg(f"只浏览未读，候选 {len(filtered_unread)} 个未读话题")
+                    return candidates
+                s.lg(f"优先浏览 {len(filtered_unread)} 个未读话题")
                 # 如果未读话题较少，可以补充一些已读话题
-                if len(unread) < 3 and read:
-                    s.lg(f"未读话题较少，补充 {min(3, len(read))} 个已读话题")
-                    return unread + read[:3]
-                return unread
+                if len(filtered_unread) < 3 and filtered_read:
+                    s.lg(
+                        f"未读话题较少，补充 {min(3, len(filtered_read))} 个已读话题"
+                    )
+                return candidates
             else:
                 s.lg("没有未读话题，浏览已读话题")
-                return read
+                return candidates
 
         return []
 
@@ -2097,6 +2265,89 @@ class GUI:
             font=(FONT_FAMILY, 8),
         ).pack(side=tk.LEFT)
 
+        # 第三行：回复数范围
+        param_row3 = tk.Frame(param, bg="#1a1a2e")
+        param_row3.pack(fill=tk.X, pady=2)
+
+        tk.Label(param_row3, text="回复数范围:", bg="#1a1a2e", fg="#eaeaea").pack(
+            side=tk.LEFT
+        )
+        s.reply_count_min_var = tk.StringVar(
+            value=str(s.cfg.get("reply_count_min", 0))
+        )
+        tk.Entry(
+            param_row3,
+            textvariable=s.reply_count_min_var,
+            width=5,
+            bg="#16213e",
+            fg="#eaeaea",
+        ).pack(side=tk.LEFT, padx=(5, 2))
+        tk.Label(param_row3, text="-", bg="#1a1a2e", fg="#eaeaea").pack(side=tk.LEFT)
+        s.reply_count_max_var = tk.StringVar(
+            value=str(s.cfg.get("reply_count_max", 120))
+        )
+        tk.Entry(
+            param_row3,
+            textvariable=s.reply_count_max_var,
+            width=5,
+            bg="#16213e",
+            fg="#eaeaea",
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Label(param_row3, text="条", bg="#1a1a2e", fg="#eaeaea").pack(
+            side=tk.LEFT, padx=(0, 5)
+        )
+        tk.Label(
+            param_row3,
+            text="(最大留空=不限，默认0-120)",
+            bg="#1a1a2e",
+            fg="#888888",
+            font=(FONT_FAMILY, 8),
+        ).pack(side=tk.LEFT)
+
+        # 第四行：话题选择策略
+        param_row4 = tk.Frame(param, bg="#1a1a2e")
+        param_row4.pack(fill=tk.X, pady=2)
+
+        s.unread_only_var = tk.BooleanVar(value=s.cfg.get("unread_only", True))
+        tk.Checkbutton(
+            param_row4,
+            text="只浏览未读话题",
+            variable=s.unread_only_var,
+            bg="#1a1a2e",
+            fg="#eaeaea",
+            selectcolor="#0f3460",
+            activebackground="#1a1a2e",
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        tk.Label(
+            param_row4,
+            text="(避免已读帖直接跳到末楼)",
+            bg="#1a1a2e",
+            fg="#888888",
+            font=(FONT_FAMILY, 8),
+        ).pack(side=tk.LEFT)
+
+        tk.Label(param_row4, text="列表下滑:", bg="#1a1a2e", fg="#eaeaea").pack(
+            side=tk.LEFT, padx=(15, 2)
+        )
+        s.list_scroll_var = tk.StringVar(value=str(s.cfg.get("list_scroll_times", 3)))
+        tk.Entry(
+            param_row4,
+            textvariable=s.list_scroll_var,
+            width=4,
+            bg="#16213e",
+            fg="#eaeaea",
+        ).pack(side=tk.LEFT)
+        tk.Label(param_row4, text="次", bg="#1a1a2e", fg="#eaeaea").pack(
+            side=tk.LEFT, padx=(2, 5)
+        )
+        tk.Label(
+            param_row4,
+            text="(找不到足够话题时加载更多)",
+            bg="#1a1a2e",
+            fg="#888888",
+            font=(FONT_FAMILY, 8),
+        ).pack(side=tk.LEFT)
+
         # 统计信息
         stats_frame = tk.LabelFrame(
             right,
@@ -2396,6 +2647,23 @@ class GUI:
             s.cfg["wait_max"] = float(parts[1]) if len(parts) > 1 else float(parts[0])
         except:
             s.cfg["wait_min"], s.cfg["wait_max"] = 1, 3
+
+        reply_min, reply_max = parse_reply_count_range(
+            s.reply_count_min_var.get(), s.reply_count_max_var.get()
+        )
+        s.cfg["reply_count_min"] = reply_min
+        s.cfg["reply_count_max"] = reply_max
+        s.reply_count_min_var.set(str(reply_min))
+        s.reply_count_max_var.set("" if reply_max is None else str(reply_max))
+        s.cfg["unread_only"] = s.unread_only_var.get()
+        try:
+            list_scroll_times = int(s.list_scroll_var.get())
+            if list_scroll_times < 0:
+                raise ValueError("list_scroll_times cannot be negative")
+        except Exception:
+            list_scroll_times = 3
+        s.cfg["list_scroll_times"] = list_scroll_times
+        s.list_scroll_var.set(str(list_scroll_times))
 
         s.start_btn.config(state=tk.DISABLED)
         s.stop_btn.config(state=tk.NORMAL)

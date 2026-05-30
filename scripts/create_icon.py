@@ -48,7 +48,10 @@ def create_icon():
         images.append(img)
 
     # 保存为 ICO
-    icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assets_dir = os.path.join(project_root, 'assets')
+    os.makedirs(assets_dir, exist_ok=True)
+    icon_path = os.path.join(assets_dir, 'icon.ico')
     images[0].save(
         icon_path,
         format='ICO',

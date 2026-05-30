@@ -9,13 +9,15 @@ import sys
 import subprocess
 import shutil
 import platform
+from pathlib import Path
 
 # 项目信息
 APP_NAME = "LinuxDoHelper"
-APP_VERSION = "8.3"
-MAIN_SCRIPT = "linux_do_gui.py"
-ICON_WIN = "icon.ico"  # Windows图标
-ICON_MAC = "icon.icns"  # macOS图标
+APP_VERSION = "8.5"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MAIN_SCRIPT = PROJECT_ROOT / "src" / "linux_do_gui.py"
+ICON_WIN = PROJECT_ROOT / "assets" / "icon.ico"  # Windows图标
+ICON_MAC = PROJECT_ROOT / "assets" / "icon.icns"  # macOS图标
 
 
 def get_platform():
@@ -32,17 +34,16 @@ def get_platform():
 
 def clean_build():
     """清理构建目录"""
-    dirs_to_clean = ["build", "dist", "__pycache__"]
+    dirs_to_clean = [PROJECT_ROOT / "build", PROJECT_ROOT / "dist", PROJECT_ROOT / "__pycache__"]
     for d in dirs_to_clean:
-        if os.path.exists(d):
+        if d.exists():
             shutil.rmtree(d)
             print(f"已清理: {d}")
 
     # 清理 .spec 文件
-    for f in os.listdir("."):
-        if f.endswith(".spec"):
-            os.remove(f)
-            print(f"已清理: {f}")
+    for f in PROJECT_ROOT.glob("*.spec"):
+        f.unlink()
+        print(f"已清理: {f}")
 
 
 def build_windows():
@@ -78,14 +79,14 @@ def build_windows():
     ]
 
     # 打包图标数据，供运行时托盘与窗口图标使用，并设置应用图标
-    if os.path.exists(ICON_WIN):
+    if ICON_WIN.exists():
         cmd.extend(["--add-data", f"{ICON_WIN};."])
-        cmd.extend(["--icon", ICON_WIN])
+        cmd.extend(["--icon", str(ICON_WIN)])
 
-    cmd.append(MAIN_SCRIPT)
+    cmd.append(str(MAIN_SCRIPT))
 
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, cwd=PROJECT_ROOT)
         print(f"\nWindows 版本打包成功!")
         print(f"输出文件: dist/{APP_NAME}_v{APP_VERSION}_Windows.exe")
         return True
@@ -127,15 +128,15 @@ def build_macos():
     ]
 
     # 打包图标数据，供运行时托盘与窗口图标使用，并设置应用图标
-    if os.path.exists(ICON_WIN):
+    if ICON_WIN.exists():
         cmd.extend(["--add-data", f"{ICON_WIN}:."])
-    if os.path.exists(ICON_MAC):
-        cmd.extend(["--icon", ICON_MAC])
+    if ICON_MAC.exists():
+        cmd.extend(["--icon", str(ICON_MAC)])
 
-    cmd.append(MAIN_SCRIPT)
+    cmd.append(str(MAIN_SCRIPT))
 
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, cwd=PROJECT_ROOT)
         print(f"\nmacOS 版本打包成功!")
         print(f"输出文件: dist/{APP_NAME}_v{APP_VERSION}_macOS")
         return True
@@ -177,13 +178,13 @@ def build_linux():
     ]
 
     # 打包图标数据，供运行时托盘与窗口图标使用
-    if os.path.exists(ICON_WIN):
+    if ICON_WIN.exists():
         cmd.extend(["--add-data", f"{ICON_WIN}:."])
 
-    cmd.append(MAIN_SCRIPT)
+    cmd.append(str(MAIN_SCRIPT))
 
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, cwd=PROJECT_ROOT)
         print(f"\nLinux 版本打包成功!")
         print(f"输出文件: dist/{APP_NAME}_v{APP_VERSION}_Linux")
         return True
@@ -202,7 +203,7 @@ def main():
     print(f"当前平台: {current_platform}")
 
     # 检查主脚本是否存在
-    if not os.path.exists(MAIN_SCRIPT):
+    if not MAIN_SCRIPT.exists():
         print(f"错误: 找不到主脚本 {MAIN_SCRIPT}")
         sys.exit(1)
 
