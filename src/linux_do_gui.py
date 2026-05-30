@@ -149,6 +149,9 @@ CFG = {
     "proxy": "127.0.0.1:7897",
     "base": "https://linux.do",
     "connect": "https://connect.linux.do",
+    "browser_backend": "builtin",
+    "bit_api_port": 54345,
+    "bit_window_id": "",
     "like_rate": 0.3,
     "reply_rate": 0.05,
     "like_reply_rate": 0.15,
@@ -464,6 +467,9 @@ class Bot:
 
         s.lg("启动浏览器...")
 
+        if s.cfg.get("browser_backend") == "bitbrowser":
+            return s._start_bitbrowser()
+
         # 重试机制（处理 404 错误）
         max_retries = 3
         for attempt in range(max_retries):
@@ -505,10 +511,75 @@ class Bot:
 
         return False
 
+    def _bit_api(s, path, payload, timeout=60):
+        """调用比特浏览器本地 API（POST JSON）"""
+        port = s.cfg.get("bit_api_port", 54345)
+        url = f"http://127.0.0.1:{port}{path}"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def _start_bitbrowser(s):
+        """通过比特浏览器 API 打开窗口并接管其 CDP 调试端口"""
+        win_id = (s.cfg.get("bit_window_id") or "").strip()
+        if not win_id:
+            s.lg("未填写比特浏览器窗口ID")
+            return False
+        try:
+            s.lg(f"通过比特浏览器打开窗口 {win_id} ...")
+            resp = s._bit_api("/browser/open", {"id": win_id})
+            if not resp or not resp.get("success"):
+                msg = resp.get("msg") if resp else "无响应"
+                s.lg(f"比特浏览器打开失败: {msg}")
+                return False
+
+            data = resp.get("data", {}) or {}
+            # http 字段即 CDP 调试地址（形如 127.0.0.1:54388）
+            addr = data.get("http") or data.get("ws") or ""
+            addr = addr.replace("ws://", "").replace("http://", "").split("/")[0]
+            if not addr:
+                s.lg("比特浏览器未返回调试地址")
+                return False
+
+            s.lg(f"连接调试地址: {addr}")
+            co = ChromiumOptions().set_address(addr)
+            s.pg = ChromiumPage(co)
+
+            # 连接后再设置窗口尺寸（比特浏览器模式无法用启动参数）
+            try:
+                import tkinter as tk
+
+                root = tk.Tk()
+                screen_height = root.winfo_screenheight()
+                root.destroy()
+                s.pg.set.window.size(1200, screen_height)
+            except Exception:
+                pass
+
+            s.lg("比特浏览器就绪")
+            return True
+        except Exception as e:
+            s.lg(f"比特浏览器启动失败: {e}")
+            s.lg("请确认：比特浏览器客户端已打开、本地API已开启、端口与窗口ID正确")
+            return False
+
     def stop(s):
         s.run = False
 
     def close(s):
+        if s.cfg.get("browser_backend") == "bitbrowser":
+            win_id = (s.cfg.get("bit_window_id") or "").strip()
+            if win_id:
+                try:
+                    s.lg("通过比特浏览器关闭窗口...")
+                    s._bit_api("/browser/close", {"id": win_id}, timeout=30)
+                except Exception as e:
+                    s.lg(f"关闭比特浏览器窗口出错: {e}")
+            s.pg = None
+            return
         if s.pg:
             try:
                 s.pg.quit()
@@ -1629,6 +1700,9 @@ class GUI:
         # 应用上次保存的配置
         s._apply_settings(s._load_settings())
 
+        # 同步浏览器后端选择对应的参数显示
+        s._on_backend_toggle()
+
         # 任何配置变化即时落盘（在应用已保存配置之后挂载，避免恢复时反复写盘）
         s._install_autosave()
 
@@ -1663,6 +1737,9 @@ class GUI:
             "reply_count_max": s.reply_count_max_var,
             "unread_only": s.unread_only_var,
             "list_scroll": s.list_scroll_var,
+            "browser_backend": s.browser_backend_var,
+            "bit_api_port": s.bit_port_var,
+            "bit_window_id": s.bit_id_var,
         }
 
     def _load_settings(s):
@@ -2167,6 +2244,70 @@ class GUI:
             font=(FONT_FAMILY, 8),
         ).pack(side=tk.LEFT, padx=5)
 
+        # 浏览器后端选择
+        browser_frame = tk.Frame(content, bg="#1a1a2e", pady=5)
+        browser_frame.pack(fill=tk.X, padx=15)
+        tk.Label(
+            browser_frame, text="浏览器:", bg="#1a1a2e", fg="#eaeaea"
+        ).pack(side=tk.LEFT)
+        s.browser_backend_var = tk.StringVar(
+            value=s.cfg.get("browser_backend", "builtin")
+        )
+        tk.Radiobutton(
+            browser_frame,
+            text="内置Chromium",
+            variable=s.browser_backend_var,
+            value="builtin",
+            bg="#1a1a2e",
+            fg="#eaeaea",
+            selectcolor="#16213e",
+            activebackground="#1a1a2e",
+            activeforeground="#00d9ff",
+            font=(FONT_FAMILY, 9),
+            command=s._on_backend_toggle,
+        ).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(
+            browser_frame,
+            text="比特浏览器",
+            variable=s.browser_backend_var,
+            value="bitbrowser",
+            bg="#1a1a2e",
+            fg="#eaeaea",
+            selectcolor="#16213e",
+            activebackground="#1a1a2e",
+            activeforeground="#00d9ff",
+            font=(FONT_FAMILY, 9),
+            command=s._on_backend_toggle,
+        ).pack(side=tk.LEFT, padx=5)
+
+        # 比特浏览器参数（仅在选择比特浏览器时显示）
+        s.bit_frame = tk.Frame(browser_frame, bg="#1a1a2e")
+        s.bit_frame.pack(side=tk.LEFT, padx=5)
+        tk.Label(
+            s.bit_frame, text="端口:", bg="#1a1a2e", fg="#eaeaea"
+        ).pack(side=tk.LEFT)
+        s.bit_port_var = tk.StringVar(value=str(s.cfg.get("bit_api_port", 54345)))
+        tk.Entry(
+            s.bit_frame,
+            textvariable=s.bit_port_var,
+            width=6,
+            bg="#16213e",
+            fg="#eaeaea",
+            insertbackground="#eaeaea",
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Label(
+            s.bit_frame, text="窗口ID:", bg="#1a1a2e", fg="#eaeaea"
+        ).pack(side=tk.LEFT)
+        s.bit_id_var = tk.StringVar(value=s.cfg.get("bit_window_id", ""))
+        tk.Entry(
+            s.bit_frame,
+            textvariable=s.bit_id_var,
+            width=18,
+            bg="#16213e",
+            fg="#eaeaea",
+            insertbackground="#eaeaea",
+        ).pack(side=tk.LEFT, padx=3)
+
         # 控制栏
         ctrl = tk.Frame(content, bg="#1a1a2e", pady=5)
         ctrl.pack(fill=tk.X, padx=15)
@@ -2499,6 +2640,13 @@ class GUI:
                 break
         s._save_settings()
 
+    def _on_backend_toggle(s):
+        """切换浏览器后端时显示/隐藏比特浏览器参数"""
+        if s.browser_backend_var.get() == "bitbrowser":
+            s.bit_frame.pack(side=tk.LEFT, padx=5)
+        else:
+            s.bit_frame.pack_forget()
+
     def _on_reply_toggle(s):
         """自动回复开关切换时的处理"""
         if s.enable_reply_var.get():
@@ -2723,6 +2871,15 @@ class GUI:
             return
         # 更新配置
         s.cfg["proxy"] = s.proxy_var.get()
+        s.cfg["browser_backend"] = s.browser_backend_var.get()
+        try:
+            s.cfg["bit_api_port"] = int(s.bit_port_var.get())
+        except Exception:
+            s.cfg["bit_api_port"] = 54345
+        s.cfg["bit_window_id"] = s.bit_id_var.get().strip()
+        if s.cfg["browser_backend"] == "bitbrowser" and not s.cfg["bit_window_id"]:
+            messagebox.showerror("错误", "请先填写比特浏览器的窗口ID")
+            return
         try:
             s.cfg["like_rate"] = int(s.like_var.get()) / 100
         except:
