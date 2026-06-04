@@ -14,64 +14,51 @@ Linux.do 论坛刷帖助手 v8.4
 10. 真实进度变化统计
 """
 
-import sys, os, random, time, json, threading
+import sys, os, random, time, json, threading, subprocess, re
 import urllib.request
-import urllib.error
-from datetime import datetime, date
+from datetime import datetime
 
-# Linux 输入法兼容性修复（必须在导入 tkinter 之前设置）
 import platform
 
-if platform.system() == "Linux":
-    # 尝试检测并设置输入法环境变量
-    if "GTK_IM_MODULE" not in os.environ:
-        # 检测 fcitx
-        if os.path.exists("/usr/bin/fcitx") or os.path.exists("/usr/bin/fcitx5"):
-            os.environ["GTK_IM_MODULE"] = "fcitx"
-            os.environ["QT_IM_MODULE"] = "fcitx"
-            os.environ["XMODIFIERS"] = "@im=fcitx"
-        # 检测 ibus
-        elif os.path.exists("/usr/bin/ibus"):
-            os.environ["GTK_IM_MODULE"] = "ibus"
-            os.environ["QT_IM_MODULE"] = "ibus"
-            os.environ["XMODIFIERS"] = "@im=ibus"
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+from linux_do.config import GITHUB_REPO, VERSION, default_categories, default_config
+from linux_do.resources import (
+    configure_linux_input_method,
+    create_tray_image,
+    get_font_names,
+    get_icon_path,
+    get_settings_path,
+)
+from linux_do.topics import (
+    build_get_topics_js,
+    count_topic_candidates,
+    filter_topics_by_reply_count,
+    merge_topic_payloads,
+    parse_reply_count_range,
+    select_topic_candidates,
+)
+
+# Linux 输入法兼容性修复（必须在导入 tkinter 之前设置）
+configure_linux_input_method()
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
-# 版本信息
-VERSION = "8.5.0"
-GITHUB_REPO = "icysaintdx/linuxdosss"
-
-# 跨平台字体配置
-import platform
-
-if platform.system() == "Darwin":  # macOS
-    FONT_FAMILY = "PingFang SC"
-    FONT_MONO = "Menlo"
-elif platform.system() == "Linux":
-    FONT_FAMILY = "Noto Sans CJK SC"
-    FONT_MONO = "Monospace"
-else:  # Windows
-    FONT_FAMILY = "Microsoft YaHei UI"
-    FONT_MONO = "Consolas"
+FONT_FAMILY, FONT_MONO = get_font_names()
 
 # 托盘支持（macOS 上禁用，因为可能导致 UI 问题）
 TRAY_SUPPORT = False
 if platform.system() != "Darwin":  # 非 macOS
     try:
         import pystray
-        from PIL import Image, ImageDraw
+        from PIL import Image
 
         TRAY_SUPPORT = True
     except ImportError:
         TRAY_SUPPORT = False
-else:
-    # macOS 上尝试导入 PIL（用于其他功能），但禁用托盘
-    try:
-        from PIL import Image, ImageDraw
-    except ImportError:
-        pass
 
 try:
     from DrissionPage import ChromiumPage, ChromiumOptions
@@ -80,335 +67,58 @@ except:
     sys.exit(1)
 
 
-def get_icon_path():
-    """获取图标路径"""
-    if getattr(sys, "frozen", False):
-        # 打包后的路径
-        base_path = sys._MEIPASS
-        return os.path.join(base_path, "icon.ico")
-    else:
-        # 开发环境路径
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        return os.path.join(project_root, "assets", "icon.ico")
+CATS = default_categories()
+CFG = default_config()
 
 
-def get_settings_path():
-    """配置文件路径（与 browser_data 同目录，工作目录下）"""
-    return os.path.join(os.getcwd(), "settings.json")
-
-
-def create_tray_image(color="#0f3460"):
-    """创建托盘图标图像"""
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    # 背景圆形
-    padding = 4
-    draw.ellipse([padding, padding, size - padding, size - padding], fill=color)
-
-    # 内圈
-    inner_padding = 12
-    draw.ellipse(
-        [inner_padding, inner_padding, size - inner_padding, size - inner_padding],
-        fill="#1a1a2e",
+def call_simprint_api(port, api_key, path, payload=None, timeout=60):
+    """调用 Simprint 本地 API（POST JSON）。"""
+    url = f"http://127.0.0.1:{port}/api/local{path}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json", "sp-api-key": api_key},
     )
-
-    # 中心点
-    center = size // 2
-    dot_size = 8
-    draw.ellipse(
-        [center - dot_size, center - dot_size, center + dot_size, center + dot_size],
-        fill="#00d9ff",
-    )
-
-    return img
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
-# 板块配置
-CATS = [
-    {"n": "开发调优", "u": "/c/develop/4", "e": True},
-    {"n": "国产替代", "u": "/c/domestic/98", "e": True},
-    {"n": "资源荟萃", "u": "/c/resource/14", "e": True},
-    {"n": "网盘资源", "u": "/c/resource/cloud-asset/94", "e": True},
-    {"n": "文档共建", "u": "/c/wiki/42", "e": True},
-    {"n": "积分乐园", "u": "/c/credit/106", "e": False},
-    {"n": "非我莫属", "u": "/c/job/27", "e": True},
-    {"n": "读书成诗", "u": "/c/reading/32", "e": True},
-    {"n": "扬帆起航", "u": "/c/startup/46", "e": False},
-    {"n": "前沿快讯", "u": "/c/news/34", "e": True},
-    {"n": "网络记忆", "u": "/c/feeds/92", "e": True},
-    {"n": "福利羊毛", "u": "/c/welfare/36", "e": True},
-    {"n": "搞七捻三", "u": "/c/gossip/11", "e": True},
-    {"n": "社区孵化", "u": "/c/incubator/102", "e": False},
-    {"n": "虫洞广场", "u": "/c/square/110", "e": True},
-    {"n": "运营反馈", "u": "/c/feedback/2", "e": False},
-]
-
-CFG = {
-    "proxy": "127.0.0.1:7897",
-    "base": "https://linux.do",
-    "connect": "https://connect.linux.do",
-    "browser_backend": "builtin",
-    "bit_api_port": 54345,
-    "bit_window_id": "",
-    "like_rate": 0.3,
-    "reply_rate": 0.05,
-    "like_reply_rate": 0.15,
-    "reply_count_min": 0,
-    "reply_count_max": 120,
-    "unread_only": True,
-    "list_scroll_times": 3,
-    "topic_candidate_target": 8,
-    "scroll_time": 3,
-    "wait_min": 1,
-    "wait_max": 3,
-    "tpl": [
-        # 感谢类
-        "感谢分享！学习了",
-        "感谢楼主的分享",
-        "感谢分享，很有帮助",
-        "感谢大佬的分享",
-        "感谢楼主无私分享",
-        "感谢分享，收藏学习",
-        "感谢楼主，学到了",
-        "感谢分享，受益匪浅",
-        # 学习类
-        "学习了，谢谢楼主！",
-        "学到了新知识，感谢",
-        "涨知识了，谢谢分享",
-        "学习学习，感谢大佬",
-        "又学到了，感谢楼主",
-        "学习一下，感谢分享",
-        "认真学习中，感谢",
-        "好好学习天天向上",
-        # 支持类
-        "支持一下，感谢分享",
-        "支持楼主，继续加油",
-        "必须支持，感谢分享",
-        "大力支持，感谢楼主",
-        "支持支持，学习了",
-        "强烈支持，感谢分享",
-        # 收藏类
-        "好文章，收藏了",
-        "收藏了，感谢分享",
-        "先收藏，慢慢学习",
-        "收藏学习，感谢楼主",
-        "马克一下，感谢分享",
-        "mark一下，以后学习",
-        "先马后看，感谢分享",
-        # 赞美类
-        "不错不错，学习了",
-        "写得很好，感谢分享",
-        "内容很棒，感谢楼主",
-        "干货满满，感谢分享",
-        "质量很高，感谢楼主",
-        "很有价值，感谢分享",
-        "非常实用，感谢楼主",
-        "很有帮助，感谢分享",
-        # 前排类
-        "前排围观，感谢分享",
-        "前排学习，感谢楼主",
-        "前排支持，感谢分享",
-        "前排关注，学习了",
-        "前排占座，感谢分享",
-        # 佬类
-        "谢谢佬，学习了",
-        "感谢佬的分享",
-        "佬太强了，学习了",
-        "跟着佬学习一下",
-        "佬就是佬，感谢分享",
-        "大佬牛逼，学习了",
-        "膜拜大佬，感谢分享",
-        # 其他
-        "路过学习，感谢分享",
-        "围观学习，感谢楼主",
-        "来学习一下，感谢",
-        "看看学习，感谢分享",
-        "顶一下，感谢分享",
-        "顶顶顶，感谢楼主",
-        "帮顶一下，感谢分享",
-        "好帖必顶，感谢楼主",
-        "精华帖子，感谢分享",
-        "优质内容，感谢楼主",
-        "实用干货，感谢分享",
-        "很有意思，感谢楼主",
-        "长见识了，感谢分享",
-        "开眼界了，感谢楼主",
-        "受教了，感谢分享",
-        "茅塞顿开，感谢楼主",
-    ],
-}
+def normalize_simprint_group_name(name):
+    """把 Linux.do / linuxdo / linux.do 等分组名归一成 linuxdo。"""
+    return re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
 
 
-def parse_reply_count_range(
-    min_text, max_text, default_min=0, default_max=120
-):
-    """Parse inclusive reply-count bounds from GUI entry text."""
-
-    def parse_bound(value, allow_blank=False):
-        text = "" if value is None else str(value).strip()
-        if text == "":
-            return None if allow_blank else default_min
-        count = int(text.replace(",", ""))
-        if count < 0:
-            raise ValueError("reply count cannot be negative")
-        return count
-
-    try:
-        reply_min = parse_bound(min_text)
-        reply_max = parse_bound(max_text, allow_blank=True)
-        if reply_max is not None and reply_min > reply_max:
-            raise ValueError("reply count min cannot exceed max")
-        return reply_min, reply_max
-    except Exception:
-        return default_min, default_max
+def is_linuxdo_simprint_group(group_name):
+    return normalize_simprint_group_name(group_name) == "linuxdo"
 
 
-def filter_topics_by_reply_count(topics, reply_min=0, reply_max=120):
-    """Keep topics whose replyCount is inside the inclusive range."""
-    filtered = []
-    for topic in topics or []:
-        reply_count = topic.get("replyCount")
-        if reply_count is None:
+def extract_linuxdo_simprint_environments(payload):
+    """从 Simprint 环境列表响应中筛出 Linux.do 分组下的环境。"""
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    items = data.get("items", []) if isinstance(data, dict) else []
+    environments = []
+    for item in items or []:
+        if not isinstance(item, dict):
             continue
-        try:
-            reply_count = int(reply_count)
-        except (TypeError, ValueError):
+        group = item.get("group") or {}
+        env = item.get("environment") or {}
+        if not isinstance(group, dict) or not isinstance(env, dict):
             continue
-        if reply_count < reply_min:
+        if not is_linuxdo_simprint_group(group.get("name")):
             continue
-        if reply_max is not None and reply_count > reply_max:
+        env_uuid = env.get("uuid")
+        if not env_uuid:
             continue
-        filtered.append(topic)
-    return filtered
-
-
-def select_topic_candidates(
-    topics_payload, reply_min=0, reply_max=120, unread_only=False
-):
-    """Filter by reply count, then keep existing unread-first fallback behavior."""
-    unread = filter_topics_by_reply_count(
-        (topics_payload or {}).get("unread", []), reply_min, reply_max
-    )
-    read = filter_topics_by_reply_count(
-        (topics_payload or {}).get("read", []), reply_min, reply_max
-    )
-
-    if unread_only:
-        return unread
-
-    if unread:
-        if len(unread) < 3 and read:
-            return unread + read[:3]
-        return unread
-    return read
-
-
-def _topic_key(topic):
-    return str(topic.get("id") or topic.get("url") or topic.get("title") or "")
-
-
-def merge_topic_payloads(existing, incoming):
-    """Merge topic payloads from repeated list scans, preserving first-seen order."""
-    merged = {"unread": [], "read": [], "all": []}
-    seen = set()
-
-    for payload in (existing or {}, incoming or {}):
-        for bucket in ("unread", "read"):
-            for topic in payload.get(bucket, []) or []:
-                key = _topic_key(topic)
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                merged[bucket].append(topic)
-
-    merged["all"] = merged["unread"] + merged["read"]
-    return merged
-
-
-def count_topic_candidates(topics_payload, reply_min=0, reply_max=120, unread_only=False):
-    return len(
-        select_topic_candidates(
-            topics_payload, reply_min, reply_max, unread_only=unread_only
+        environments.append(
+            {
+                "uuid": str(env_uuid),
+                "name": str(env.get("name") or env_uuid),
+                "status": str(env.get("status") or ""),
+                "group_name": str(group.get("name") or ""),
+            }
         )
-    )
-
-
-def build_get_topics_js():
-    """Build JS that reads topics and the list-page reply column."""
-    return """
-        function getTopics() {
-            function parseReplyCount(text) {
-                const normalized = String(text || '').trim().replace(/,/g, '');
-                const wanMatch = normalized.match(/([0-9]+(?:[.][0-9]+)?)\\s*万/);
-                if (wanMatch) {
-                    return Math.round(parseFloat(wanMatch[1]) * 10000);
-                }
-                const kMatch = normalized.match(/([0-9]+(?:[.][0-9]+)?)\\s*[kK]/);
-                if (kMatch) {
-                    return Math.round(parseFloat(kMatch[1]) * 1000);
-                }
-                const numMatch = normalized.match(/[0-9]+/);
-                return numMatch ? parseInt(numMatch[0], 10) : null;
-            }
-
-            function getReplyCount(row) {
-                const replyNode = row.querySelector(
-                    'td.num.posts-map.posts button, td.num.posts-map.posts'
-                );
-                if (!replyNode) {
-                    return null;
-                }
-                return parseReplyCount(replyNode.textContent);
-            }
-
-            const rows = document.querySelectorAll('tr.topic-list-item');
-            const unreadTopics = [];  // 未读话题（带小蓝点）
-            const readTopics = [];    // 已读话题（无小蓝点）
-
-            rows.forEach(row => {
-                const link = row.querySelector('a.title.raw-link.raw-topic-link, a.title');
-                if (link) {
-                    const href = link.getAttribute('href');
-                    const title = link.textContent.trim();
-                    const topicId = row.getAttribute('data-topic-id');
-                    const replyCount = getReplyCount(row);
-
-                    // 跳过置顶帖和无法识别回复数的话题。
-                    if (replyCount === null) {
-                        return;
-                    }
-
-                    if (href && title && !row.classList.contains('pinned')) {
-                        // 检查是否有小蓝点（未读标记）
-                        const newTopicBadge = row.querySelector('.badge.badge-notification.new-topic');
-
-                        const topicData = {
-                            url: href,
-                            title: title.substring(0, 50),
-                            id: topicId,
-                            isUnread: !!newTopicBadge,  // 是否未读
-                            replyCount: replyCount
-                        };
-
-                        if (newTopicBadge) {
-                            unreadTopics.push(topicData);
-                        } else {
-                            readTopics.push(topicData);
-                        }
-                    }
-                }
-            });
-
-            return {
-                unread: unreadTopics,
-                read: readTopics,
-                all: [...unreadTopics, ...readTopics]
-            };
-        }
-        return getTopics();
-        """
+    return environments
 
 
 class Bot:
@@ -469,6 +179,8 @@ class Bot:
 
         if s.cfg.get("browser_backend") == "bitbrowser":
             return s._start_bitbrowser()
+        if s.cfg.get("browser_backend") == "simprint":
+            return s._start_simprint()
 
         # 重试机制（处理 404 错误）
         max_retries = 3
@@ -522,6 +234,91 @@ class Bot:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
 
+    def _simprint_api(s, path, payload, timeout=60):
+        """调用 Simprint 本地 API（POST JSON）。"""
+        port = s.cfg.get("simprint_api_port", 8080)
+        api_key = (s.cfg.get("simprint_api_key") or "").strip()
+        return call_simprint_api(port, api_key, path, payload, timeout=timeout)
+
+    def _extract_debug_address(s, data):
+        """从 API 返回中提取可能存在的 CDP 调试地址。"""
+        if not isinstance(data, dict):
+            return ""
+        for key in (
+            "http",
+            "ws",
+            "debuggingAddress",
+            "debugging_address",
+            "remoteDebuggingAddress",
+            "remote_debugging_address",
+            "debuggerAddress",
+            "debugger_address",
+        ):
+            value = data.get(key)
+            if value:
+                return str(value).replace("ws://", "").replace("http://", "").split("/")[0]
+        for key in ("debuggingPort", "debugging_port", "remoteDebuggingPort"):
+            value = data.get(key)
+            if value:
+                return f"127.0.0.1:{value}"
+        for value in data.values():
+            nested = s._extract_debug_address(value)
+            if nested:
+                return nested
+        return ""
+
+    def _simprint_command_lines(s, env_uuid):
+        """读取当前进程命令行，用于找到 Simprint 暴露的 remote debugging 端口。"""
+        if platform.system() == "Windows":
+            ps_script = (
+                "$envUuid = '" + env_uuid.replace("'", "''") + "'; "
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.CommandLine -and $_.CommandLine.Contains('--simprint-env-id=' + $envUuid) } | "
+                "ForEach-Object { $_.CommandLine }"
+            )
+            for shell_name in ("powershell", "pwsh"):
+                try:
+                    result = subprocess.run(
+                        [shell_name, "-NoProfile", "-Command", ps_script],
+                        capture_output=True,
+                        text=True,
+                        timeout=8,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        return result.stdout.splitlines()
+                except Exception:
+                    continue
+            return []
+
+        try:
+            result = subprocess.run(
+                ["ps", "-eo", "command"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if result.returncode != 0:
+                return []
+            return [
+                line
+                for line in result.stdout.splitlines()
+                if f"--simprint-env-id={env_uuid}" in line
+            ]
+        except Exception:
+            return []
+
+    def _find_simprint_debug_address(s, env_uuid, timeout=20):
+        """等待 Simprint 浏览器进程出现，并提取 remote debugging 端口。"""
+        deadline = time.time() + timeout
+        pattern = re.compile(r"--remote-debugging-port=(\d+)")
+        while time.time() < deadline:
+            for command_line in s._simprint_command_lines(env_uuid):
+                match = pattern.search(command_line)
+                if match:
+                    return f"127.0.0.1:{match.group(1)}"
+            time.sleep(0.5)
+        return ""
+
     def _start_bitbrowser(s):
         """通过比特浏览器 API 打开窗口并接管其 CDP 调试端口"""
         win_id = (s.cfg.get("bit_window_id") or "").strip()
@@ -566,6 +363,58 @@ class Bot:
             s.lg("请确认：比特浏览器客户端已打开、本地API已开启、端口与窗口ID正确")
             return False
 
+    def _start_simprint(s):
+        """通过 Simprint API 打开环境并接管其 CDP 调试端口。"""
+        env_uuid = (s.cfg.get("simprint_env_uuid") or "").strip()
+        api_key = (s.cfg.get("simprint_api_key") or "").strip()
+        if not env_uuid:
+            s.lg("未填写 Simprint 环境UUID")
+            return False
+        if not api_key:
+            s.lg("未填写 Simprint API Key")
+            return False
+        try:
+            s.lg(f"通过 Simprint 打开环境 {env_uuid} ...")
+            resp = s._simprint_api("/environments/start", {"envUuid": env_uuid})
+            if not resp or resp.get("code") != 1:
+                msg = resp.get("message") or resp.get("msg") if resp else "无响应"
+                s.lg(f"Simprint 打开失败: {msg}")
+                return False
+
+            data = resp.get("data", {}) or {}
+            if isinstance(data, dict) and data.get("success") is False:
+                s.lg("Simprint 打开失败: success=false")
+                return False
+
+            addr = s._extract_debug_address(data)
+            if not addr:
+                s.lg("Simprint 未在 API 返回调试地址，尝试从进程中查找端口...")
+                addr = s._find_simprint_debug_address(env_uuid)
+            if not addr:
+                s.lg("Simprint 未找到 remote debugging 端口")
+                return False
+
+            s.lg(f"连接 Simprint 调试地址: {addr}")
+            co = ChromiumOptions().set_address(addr)
+            s.pg = ChromiumPage(co)
+
+            try:
+                import tkinter as tk
+
+                root = tk.Tk()
+                screen_height = root.winfo_screenheight()
+                root.destroy()
+                s.pg.set.window.size(1200, screen_height)
+            except Exception:
+                pass
+
+            s.lg("Simprint 就绪")
+            return True
+        except Exception as e:
+            s.lg(f"Simprint 启动失败: {e}")
+            s.lg("请确认：Simprint 客户端已打开、本地API已开启、端口/API Key/环境UUID正确")
+            return False
+
     def stop(s):
         s.run = False
 
@@ -578,6 +427,16 @@ class Bot:
                     s._bit_api("/browser/close", {"id": win_id}, timeout=30)
                 except Exception as e:
                     s.lg(f"关闭比特浏览器窗口出错: {e}")
+            s.pg = None
+            return
+        if s.cfg.get("browser_backend") == "simprint":
+            env_uuid = (s.cfg.get("simprint_env_uuid") or "").strip()
+            if env_uuid:
+                try:
+                    s.lg("通过 Simprint 关闭环境...")
+                    s._simprint_api("/environments/stop", {"envUuid": env_uuid}, timeout=30)
+                except Exception as e:
+                    s.lg(f"关闭 Simprint 环境出错: {e}")
             s.pg = None
             return
         if s.pg:
@@ -1740,6 +1599,9 @@ class GUI:
             "browser_backend": s.browser_backend_var,
             "bit_api_port": s.bit_port_var,
             "bit_window_id": s.bit_id_var,
+            "simprint_api_port": s.simprint_port_var,
+            "simprint_api_key": s.simprint_key_var,
+            "simprint_env_uuid": s.simprint_env_var,
         }
 
     def _load_settings(s):
@@ -2245,8 +2107,12 @@ class GUI:
         ).pack(side=tk.LEFT, padx=5)
 
         # 浏览器后端选择
-        browser_frame = tk.Frame(content, bg="#1a1a2e", pady=5)
-        browser_frame.pack(fill=tk.X, padx=15)
+        browser_block = tk.Frame(content, bg="#1a1a2e", pady=5)
+        browser_block.pack(fill=tk.X, padx=15)
+        browser_frame = tk.Frame(browser_block, bg="#1a1a2e")
+        browser_frame.pack(fill=tk.X)
+        browser_param_frame = tk.Frame(browser_block, bg="#1a1a2e")
+        browser_param_frame.pack(fill=tk.X, pady=(4, 0))
         tk.Label(
             browser_frame, text="浏览器:", bg="#1a1a2e", fg="#eaeaea"
         ).pack(side=tk.LEFT)
@@ -2279,9 +2145,22 @@ class GUI:
             font=(FONT_FAMILY, 9),
             command=s._on_backend_toggle,
         ).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(
+            browser_frame,
+            text="Simprint",
+            variable=s.browser_backend_var,
+            value="simprint",
+            bg="#1a1a2e",
+            fg="#eaeaea",
+            selectcolor="#16213e",
+            activebackground="#1a1a2e",
+            activeforeground="#00d9ff",
+            font=(FONT_FAMILY, 9),
+            command=s._on_backend_toggle,
+        ).pack(side=tk.LEFT, padx=5)
 
         # 比特浏览器参数（仅在选择比特浏览器时显示）
-        s.bit_frame = tk.Frame(browser_frame, bg="#1a1a2e")
+        s.bit_frame = tk.Frame(browser_param_frame, bg="#1a1a2e")
         s.bit_frame.pack(side=tk.LEFT, padx=5)
         tk.Label(
             s.bit_frame, text="端口:", bg="#1a1a2e", fg="#eaeaea"
@@ -2307,6 +2186,71 @@ class GUI:
             fg="#eaeaea",
             insertbackground="#eaeaea",
         ).pack(side=tk.LEFT, padx=3)
+
+        # Simprint 参数（仅在选择 Simprint 时显示）
+        s.simprint_frame = tk.Frame(browser_param_frame, bg="#1a1a2e")
+        s.simprint_frame.pack(side=tk.LEFT, padx=5)
+        tk.Label(
+            s.simprint_frame, text="端口:", bg="#1a1a2e", fg="#eaeaea"
+        ).pack(side=tk.LEFT)
+        s.simprint_port_var = tk.StringVar(
+            value=str(s.cfg.get("simprint_api_port", 8080))
+        )
+        tk.Entry(
+            s.simprint_frame,
+            textvariable=s.simprint_port_var,
+            width=6,
+            bg="#16213e",
+            fg="#eaeaea",
+            insertbackground="#eaeaea",
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Label(
+            s.simprint_frame, text="Key:", bg="#1a1a2e", fg="#eaeaea"
+        ).pack(side=tk.LEFT)
+        s.simprint_key_var = tk.StringVar(value=s.cfg.get("simprint_api_key", ""))
+        tk.Entry(
+            s.simprint_frame,
+            textvariable=s.simprint_key_var,
+            width=22,
+            bg="#16213e",
+            fg="#eaeaea",
+            insertbackground="#eaeaea",
+            show="*",
+        ).pack(side=tk.LEFT, padx=3)
+        tk.Label(
+            s.simprint_frame, text="环境UUID:", bg="#1a1a2e", fg="#eaeaea"
+        ).pack(side=tk.LEFT)
+        s.simprint_env_var = tk.StringVar(value=s.cfg.get("simprint_env_uuid", ""))
+        tk.Entry(
+            s.simprint_frame,
+            textvariable=s.simprint_env_var,
+            width=24,
+            bg="#16213e",
+            fg="#eaeaea",
+            insertbackground="#eaeaea",
+        ).pack(side=tk.LEFT, padx=3)
+        s.simprint_fetch_btn = tk.Button(
+            s.simprint_frame,
+            text="获取环境",
+            command=s._on_simprint_fetch_envs,
+            bg="#0f3460",
+            fg="#eaeaea",
+            activebackground="#00d9ff",
+            activeforeground="#1a1a2e",
+            font=(FONT_FAMILY, 9),
+            padx=8,
+        )
+        s.simprint_fetch_btn.pack(side=tk.LEFT, padx=3)
+        s.simprint_env_options = {}
+        s.simprint_env_select_var = tk.StringVar(value="")
+        s.simprint_env_combo = ttk.Combobox(
+            s.simprint_frame,
+            textvariable=s.simprint_env_select_var,
+            width=28,
+            state="readonly",
+        )
+        s.simprint_env_combo.pack(side=tk.LEFT, padx=3)
+        s.simprint_env_combo.bind("<<ComboboxSelected>>", s._on_simprint_env_select)
 
         # 控制栏
         ctrl = tk.Frame(content, bg="#1a1a2e", pady=5)
@@ -2641,11 +2585,112 @@ class GUI:
         s._save_settings()
 
     def _on_backend_toggle(s):
-        """切换浏览器后端时显示/隐藏比特浏览器参数"""
+        """切换浏览器后端时显示/隐藏对应参数"""
         if s.browser_backend_var.get() == "bitbrowser":
             s.bit_frame.pack(side=tk.LEFT, padx=5)
         else:
             s.bit_frame.pack_forget()
+        if s.browser_backend_var.get() == "simprint":
+            s.simprint_frame.pack(side=tk.LEFT, padx=5)
+        else:
+            s.simprint_frame.pack_forget()
+
+    def _simprint_api_params_from_ui(s):
+        try:
+            port = int(s.simprint_port_var.get())
+        except Exception:
+            port = 8080
+            s.simprint_port_var.set(str(port))
+        api_key = s.simprint_key_var.get().strip()
+        if not api_key:
+            messagebox.showerror("错误", "请先填写 Simprint API Key")
+            return None
+        return port, api_key
+
+    def _load_linuxdo_simprint_envs(s, port, api_key):
+        page = 1
+        page_size = 100
+        environments = []
+
+        while True:
+            payload = {"page": page, "page_size": page_size}
+            resp = call_simprint_api(
+                port,
+                api_key,
+                "/environments/list",
+                payload,
+                timeout=20,
+            )
+            if not resp or resp.get("code") != 1:
+                msg = resp.get("message") or resp.get("msg") if resp else "无响应"
+                raise RuntimeError(msg)
+
+            data = resp.get("data", {}) or {}
+            items = data.get("items", []) or []
+            environments.extend(extract_linuxdo_simprint_environments(resp))
+
+            total = data.get("total")
+            if isinstance(total, int):
+                if page * page_size >= total:
+                    break
+            elif len(items) < page_size:
+                break
+            page += 1
+
+        return environments
+
+    def _on_simprint_fetch_envs(s):
+        params = s._simprint_api_params_from_ui()
+        if not params:
+            return
+        port, api_key = params
+        s.simprint_fetch_btn.config(state=tk.DISABLED, text="获取中...")
+
+        def worker():
+            try:
+                environments = s._load_linuxdo_simprint_envs(port, api_key)
+                s.rt.after(0, lambda: s._finish_simprint_fetch_envs(environments, None))
+            except Exception as e:
+                s.rt.after(0, lambda error=e: s._finish_simprint_fetch_envs([], error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_simprint_fetch_envs(s, environments, error):
+        s.simprint_fetch_btn.config(state=tk.NORMAL, text="获取环境")
+        if error:
+            messagebox.showerror("错误", f"获取 Simprint 环境失败：{error}")
+            return
+        if not environments:
+            s.simprint_env_options = {}
+            s.simprint_env_combo["values"] = []
+            s.simprint_env_select_var.set("")
+            messagebox.showinfo(
+                "未找到环境",
+                "未找到分组名为 linuxdo / Linuxdo / linux.do / Linux.do 的 Simprint 环境",
+            )
+            return
+
+        options = {}
+        values = []
+        for env in environments:
+            status = f" [{env['status']}]" if env.get("status") else ""
+            label = f"{env['name']}{status} | {env['uuid']}"
+            options[label] = env["uuid"]
+            values.append(label)
+
+        s.simprint_env_options = options
+        s.simprint_env_combo["values"] = values
+        s.simprint_env_select_var.set(values[0])
+        s.simprint_env_var.set(options[values[0]])
+        s._save_settings()
+        messagebox.showinfo("完成", f"找到 {len(values)} 个 Linux.do 分组环境，已填入第一个 UUID")
+
+    def _on_simprint_env_select(s, event=None):
+        label = s.simprint_env_select_var.get()
+        env_uuid = s.simprint_env_options.get(label)
+        if env_uuid:
+            s.simprint_env_var.set(env_uuid)
+            s._save_settings()
 
     def _on_reply_toggle(s):
         """自动回复开关切换时的处理"""
@@ -2880,6 +2925,19 @@ class GUI:
         if s.cfg["browser_backend"] == "bitbrowser" and not s.cfg["bit_window_id"]:
             messagebox.showerror("错误", "请先填写比特浏览器的窗口ID")
             return
+        try:
+            s.cfg["simprint_api_port"] = int(s.simprint_port_var.get())
+        except Exception:
+            s.cfg["simprint_api_port"] = 8080
+        s.cfg["simprint_api_key"] = s.simprint_key_var.get().strip()
+        s.cfg["simprint_env_uuid"] = s.simprint_env_var.get().strip()
+        if s.cfg["browser_backend"] == "simprint":
+            if not s.cfg["simprint_api_key"]:
+                messagebox.showerror("错误", "请先填写 Simprint API Key")
+                return
+            if not s.cfg["simprint_env_uuid"]:
+                messagebox.showerror("错误", "请先填写 Simprint 环境UUID")
+                return
         try:
             s.cfg["like_rate"] = int(s.like_var.get()) / 100
         except:
