@@ -45,7 +45,7 @@ from linux_do.topics import (
 configure_linux_input_method()
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, messagebox
 
 FONT_FAMILY, FONT_MONO = get_font_names()
 
@@ -79,6 +79,19 @@ def call_simprint_api(port, api_key, path, payload=None, timeout=60):
         url,
         data=data,
         headers={"Content-Type": "application/json", "sp-api-key": api_key},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def call_bitbrowser_api(port, path, payload=None, timeout=60):
+    """调用比特浏览器本地 API（POST JSON）。"""
+    url = f"http://127.0.0.1:{port}{path}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
@@ -121,6 +134,109 @@ def extract_linuxdo_simprint_environments(payload):
     return environments
 
 
+def extract_bitbrowser_windows(payload):
+    """从比特浏览器窗口列表响应中提取可选择的窗口信息。"""
+    if not isinstance(payload, dict):
+        return []
+
+    data = payload.get("data", payload)
+    if not isinstance(data, (dict, list)):
+        return []
+
+    if isinstance(data, list):
+        items = data
+    else:
+        items = None
+        for key in (
+            "list",
+            "items",
+            "browserList",
+            "browser_list",
+            "windows",
+            "data",
+        ):
+            value = data.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+    if items is None:
+        return []
+
+    windows = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        window_id = next(
+            (
+                item.get(key)
+                for key in ("id", "windowId", "window_id", "browserId", "browser_id")
+                if item.get(key)
+            ),
+            None,
+        )
+        if not window_id:
+            continue
+        window_id = str(window_id)
+        if window_id in seen:
+            continue
+        seen.add(window_id)
+        name = next(
+            (
+                item.get(key)
+                for key in ("name", "title", "browserName", "browser_name", "remark")
+                if item.get(key)
+            ),
+            window_id,
+        )
+        remark = str(item.get("remark") or "").strip()
+        seq = item.get("seq")
+        status = next(
+            (
+                item.get(key)
+                for key in ("status", "openStatus", "open_status", "state")
+                if item.get(key) not in (None, "")
+            ),
+            "",
+        )
+        windows.append(
+            {
+                "id": window_id,
+                "name": str(name),
+                "remark": remark,
+                "seq": seq,
+                "status": str(status),
+            }
+        )
+    return windows
+
+
+def format_bitbrowser_window_label(window):
+    """格式化窗口选择器标签，只显示“序号 - 名字”。"""
+    if not isinstance(window, dict):
+        return ""
+    window_id = str(window.get("id") or "")
+    name = str(window.get("name") or window_id).strip()
+    seq = window.get("seq")
+    seq_text = str(seq).strip() if seq not in (None, "") else "-"
+    return f"{seq_text} - {name}"
+
+
+def migrate_bitbrowser_window_label(label, window_id=""):
+    """把旧版“名称... | ID”标签迁移为“序号 - 名称”。"""
+    text = str(label or "").strip()
+    if re.match(r"^\d+\s+-\s+", text):
+        return text
+
+    legacy = text.split(" | ", 1)[0]
+    match = re.match(r"^(.*?)\s+#(\d+)(?:\s+\[[^]]*\])?$", legacy)
+    if match:
+        name = re.sub(r"\s+\([^()]*\)$", "", match.group(1)).strip()
+        if name:
+            return f"{match.group(2)} - {name}"
+    return text
+
+
 class Bot:
     def __init__(
         s,
@@ -136,6 +252,7 @@ class Bot:
         enable_reply=True,
         enable_wait=True,
         browse_mode="deep",
+        screen_height=None,
     ):
         s.cfg = cfg
         s.cats = cats
@@ -149,6 +266,8 @@ class Bot:
         s.enable_reply = enable_reply  # 是否启用自动回复
         s.enable_wait = enable_wait  # 是否启用等待时间
         s.browse_mode = browse_mode  # 浏览模式：deep(深度爬楼), quick(快速浏览3-5层)
+        # GUI 由主线程提前读取屏幕高度，避免后台线程重复创建 Tk 根窗口。
+        s.screen_height = screen_height
         s.pg = None
         s.run = False
         s.stats = {"topic": 0, "like": 0, "reply": 0, "like_reply": 0, "floors": 0}
@@ -163,6 +282,32 @@ class Bot:
         if reason:
             s.lg(f"[防风控] {reason}，等待 {delay:.1f}s")
         time.sleep(delay)
+
+    def _get_screen_height(s):
+        """返回用于浏览器窗口布局的屏幕高度。"""
+        if s.screen_height:
+            return s.screen_height
+
+        # 保留 Bot 独立使用时的兼容路径；GUI 启动时不会走这里。
+        try:
+            import tkinter as tk
+
+            root = tk.Tk()
+            try:
+                return root.winfo_screenheight()
+            finally:
+                root.destroy()
+        except Exception:
+            return 900
+
+    def _set_connected_window_size(s):
+        """连接外部浏览器后设置窗口尺寸，失败时保持原窗口布局。"""
+        if not s.pg:
+            return
+        try:
+            s.pg.set.window.size(1200, s._get_screen_height())
+        except Exception:
+            pass
 
     def start(s):
         # 确保先关闭旧的浏览器实例
@@ -182,6 +327,10 @@ class Bot:
         if s.cfg.get("browser_backend") == "simprint":
             return s._start_simprint()
 
+        return s._start_builtin()
+
+    def _start_builtin(s):
+        """启动内置 Chromium，保留原有 404 重试策略。"""
         # 重试机制（处理 404 错误）
         max_retries = 3
         for attempt in range(max_retries):
@@ -196,14 +345,8 @@ class Bot:
                     co.set_proxy(s.cfg["proxy"])
                 co.set_argument("--disable-blink-features=AutomationControlled")
 
-                # 设置浏览器窗口大小为屏幕高度
-                import tkinter as tk
-
-                root = tk.Tk()
-                screen_height = root.winfo_screenheight()
-                root.destroy()
-
                 # 设置窗口大小：宽度1200，高度为屏幕高度
+                screen_height = s._get_screen_height()
                 co.set_argument(f"--window-size=1200,{screen_height}")
                 s.lg(f"设置浏览器窗口大小: 1200x{screen_height}")
 
@@ -223,16 +366,10 @@ class Bot:
 
         return False
 
-    def _bit_api(s, path, payload, timeout=60):
+    def _bit_api(s, path, payload, timeout=60, port=None):
         """调用比特浏览器本地 API（POST JSON）"""
-        port = s.cfg.get("bit_api_port", 54345)
-        url = f"http://127.0.0.1:{port}{path}"
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        port = port or s.cfg.get("bit_api_port", 54345)
+        return call_bitbrowser_api(port, path, payload, timeout=timeout)
 
     def _simprint_api(s, path, payload, timeout=60):
         """调用 Simprint 本地 API（POST JSON）。"""
@@ -346,15 +483,7 @@ class Bot:
             s.pg = ChromiumPage(co)
 
             # 连接后再设置窗口尺寸（比特浏览器模式无法用启动参数）
-            try:
-                import tkinter as tk
-
-                root = tk.Tk()
-                screen_height = root.winfo_screenheight()
-                root.destroy()
-                s.pg.set.window.size(1200, screen_height)
-            except Exception:
-                pass
+            s._set_connected_window_size()
 
             s.lg("比特浏览器就绪")
             return True
@@ -398,15 +527,7 @@ class Bot:
             co = ChromiumOptions().set_address(addr)
             s.pg = ChromiumPage(co)
 
-            try:
-                import tkinter as tk
-
-                root = tk.Tk()
-                screen_height = root.winfo_screenheight()
-                root.destroy()
-                s.pg.set.window.size(1200, screen_height)
-            except Exception:
-                pass
+            s._set_connected_window_size()
 
             s.lg("Simprint 就绪")
             return True
@@ -1327,6 +1448,8 @@ class Bot:
         s.start_time = time.time()  # 记录开始时间
 
         if not s.start():
+            # 启动失败时同步结束运行状态，避免 GUI 已收尾而 Bot 仍保持运行。
+            s.run = False
             return
 
         login_success = False
@@ -1522,9 +1645,15 @@ class Bot:
 class GUI:
     def __init__(s):
         s.rt = tk.Tk()
+        s.screen_height = s.rt.winfo_screenheight()
         s.rt.title(f"Linux.do 刷帖助手 v{VERSION}")
-        s.rt.geometry("700x950")
-        s.rt.minsize(650, 850)  # 设置最小窗口大小
+        # Keep the statistics section visible on typical displays while leaving
+        # enough room for the system title bar and taskbar on smaller screens.
+        available_height = max(600, s.screen_height - 80)
+        initial_height = min(1050, available_height)
+        minimum_height = min(900, max(560, available_height - 20))
+        s.rt.geometry(f"700x{initial_height}")
+        s.rt.minsize(650, minimum_height)  # 设置最小窗口大小
         s.rt.configure(bg="#1a1a2e")
 
         # 设置窗口图标
@@ -1538,8 +1667,9 @@ class GUI:
         # 不使用overrideredirect，保留系统标题栏以支持窗口拉伸
         # s.rt.overrideredirect(True)  # 移除默认标题栏
 
-        s.cats = [c.copy() for c in CATS]
-        s.cfg = CFG.copy()
+        # 每个 GUI 实例使用独立的默认状态，避免共享嵌套配置对象。
+        s.cats = default_categories()
+        s.cfg = default_config()
         s.bot = None
         s.th = None
         s.req_labels = {}  # 升级要求标签
@@ -1631,6 +1761,34 @@ class GUI:
                     if cat["n"] in s.cat_vars:
                         s.cat_vars[cat["n"]].set(cat["e"])
 
+        # 恢复上次获取的 BitBrowser 窗口列表和当前选择。
+        bit_options = data.get("bit_window_options")
+        if isinstance(bit_options, dict):
+            s.bit_window_options = {}
+            for label, window_id in bit_options.items():
+                if not label or not window_id:
+                    continue
+                migrated_label = migrate_bitbrowser_window_label(label, window_id)
+                s.bit_window_options[migrated_label] = str(window_id)
+            values = list(s.bit_window_options)
+            s.bit_window_combo["values"] = values
+            selected_label = migrate_bitbrowser_window_label(
+                data.get("bit_window_selection"), s.bit_id_var.get().strip()
+            )
+            selected_id = s.bit_id_var.get().strip()
+            if selected_label not in s.bit_window_options:
+                selected_label = next(
+                    (
+                        label
+                        for label, window_id in s.bit_window_options.items()
+                        if window_id == selected_id
+                    ),
+                    "",
+                )
+            if selected_label:
+                s.bit_window_select_var.set(selected_label)
+                s.bit_id_var.set(s.bit_window_options[selected_label])
+
     def _collect_settings(s):
         """收集当前 UI 控件的值，用于写盘"""
         data = {key: var.get() for key, var in s._settings_var_map().items()}
@@ -1639,6 +1797,8 @@ class GUI:
             for cat in s.cats
             if cat["n"] in s.cat_vars
         }
+        data["bit_window_options"] = dict(s.bit_window_options)
+        data["bit_window_selection"] = s.bit_window_select_var.get()
         return data
 
     def _save_settings(s):
@@ -1896,6 +2056,29 @@ class GUI:
         content = tk.Frame(s.rt, bg="#1a1a2e")
         content.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
+        # 信息展示容器，仅放置升级进度的显示开关。
+        display_frame = tk.LabelFrame(
+            content,
+            text=" 信息展示 ",
+            bg="#1a1a2e",
+            fg="#00d9ff",
+            font=(FONT_FAMILY, 10, "bold"),
+        )
+        display_frame.pack(fill=tk.X, padx=15, pady=5)
+
+        s.progress_expanded_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            display_frame,
+            text="显示升级进度",
+            variable=s.progress_expanded_var,
+            command=s._toggle_progress_panel,
+            bg="#1a1a2e",
+            fg="#eaeaea",
+            selectcolor="#0f3460",
+            activebackground="#1a1a2e",
+            activeforeground="#ffffff",
+        ).pack(anchor="e", padx=10, pady=(2, 0))
+
         # 用户信息栏
         info_frame = tk.LabelFrame(
             content,
@@ -1943,14 +2126,14 @@ class GUI:
             fg="#00d9ff",
             font=(FONT_FAMILY, 10, "bold"),
         )
-        progress_frame.pack(fill=tk.X, padx=15, pady=5)
+        s.progress_frame = progress_frame
+        # 默认关闭时不显示整个升级进度区域。
+
+        s.progress_content = tk.Frame(progress_frame, bg="#1a1a2e")
 
         # 创建Canvas和滚动条
         s.progress_canvas = tk.Canvas(
-            progress_frame, bg="#1a1a2e", height=200, highlightthickness=0
-        )
-        s.progress_scrollbar = ttk.Scrollbar(
-            progress_frame, orient="vertical", command=s.progress_canvas.yview
+            s.progress_content, bg="#1a1a2e", height=200, highlightthickness=0
         )
         s.progress_inner = tk.Frame(s.progress_canvas, bg="#1a1a2e")
 
@@ -1962,10 +2145,9 @@ class GUI:
         )
 
         s.progress_canvas.create_window((0, 0), window=s.progress_inner, anchor="nw")
-        s.progress_canvas.configure(yscrollcommand=s.progress_scrollbar.set)
-
-        s.progress_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-        s.progress_scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
+        s.progress_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        s.progress_canvas.bind("<MouseWheel>", lambda e: s.progress_canvas.yview_scroll(int(-e.delta / 120), "units"))
+        s.progress_content.pack(fill=tk.X, padx=5, pady=(0, 5))
 
         # 运行模式选择
         mode_frame = tk.LabelFrame(
@@ -1976,6 +2158,8 @@ class GUI:
             font=(FONT_FAMILY, 10, "bold"),
         )
         mode_frame.pack(fill=tk.X, padx=15, pady=5)
+        # 记录进度面板的插入位置，重新显示时仍位于运行模式之前。
+        s.progress_insert_before = mode_frame
 
         mode_inner = tk.Frame(mode_frame, bg="#1a1a2e")
         mode_inner.pack(fill=tk.X, padx=10, pady=8)
@@ -2106,9 +2290,18 @@ class GUI:
             font=(FONT_FAMILY, 8),
         ).pack(side=tk.LEFT, padx=5)
 
-        # 浏览器后端选择
-        browser_block = tk.Frame(content, bg="#1a1a2e", pady=5)
-        browser_block.pack(fill=tk.X, padx=15)
+        # 浏览器、后端参数与代理设置
+        browser_network_frame = tk.LabelFrame(
+            content,
+            text=" 浏览器与代理 ",
+            bg="#1a1a2e",
+            fg="#00d9ff",
+            font=(FONT_FAMILY, 10, "bold"),
+        )
+        browser_network_frame.pack(fill=tk.X, padx=15, pady=5)
+
+        browser_block = tk.Frame(browser_network_frame, bg="#1a1a2e", pady=3)
+        browser_block.pack(fill=tk.X, padx=10, pady=(3, 0))
         browser_frame = tk.Frame(browser_block, bg="#1a1a2e")
         browser_frame.pack(fill=tk.X)
         browser_param_frame = tk.Frame(browser_block, bg="#1a1a2e")
@@ -2174,18 +2367,32 @@ class GUI:
             fg="#eaeaea",
             insertbackground="#eaeaea",
         ).pack(side=tk.LEFT, padx=3)
-        tk.Label(
-            s.bit_frame, text="窗口ID:", bg="#1a1a2e", fg="#eaeaea"
-        ).pack(side=tk.LEFT)
+        # 窗口 ID 仅作为内部持久化值，由窗口选择器维护。
         s.bit_id_var = tk.StringVar(value=s.cfg.get("bit_window_id", ""))
-        tk.Entry(
+        s.bit_fetch_btn = tk.Button(
             s.bit_frame,
-            textvariable=s.bit_id_var,
-            width=18,
-            bg="#16213e",
+            text="获取窗口",
+            command=s._on_bitbrowser_fetch_windows,
+            bg="#0f3460",
             fg="#eaeaea",
-            insertbackground="#eaeaea",
-        ).pack(side=tk.LEFT, padx=3)
+            activebackground="#00d9ff",
+            activeforeground="#1a1a2e",
+            font=(FONT_FAMILY, 9),
+            padx=8,
+        )
+        s.bit_fetch_btn.pack(side=tk.LEFT, padx=3)
+        s.bit_window_options = {}
+        s.bit_window_select_var = tk.StringVar(value="")
+        s.bit_window_combo = ttk.Combobox(
+            s.bit_frame,
+            textvariable=s.bit_window_select_var,
+            width=38,
+            state="readonly",
+        )
+        s.bit_window_combo.pack(side=tk.LEFT, padx=3)
+        s.bit_window_combo.bind(
+            "<<ComboboxSelected>>", s._on_bitbrowser_window_select
+        )
 
         # Simprint 参数（仅在选择 Simprint 时显示）
         s.simprint_frame = tk.Frame(browser_param_frame, bg="#1a1a2e")
@@ -2252,9 +2459,9 @@ class GUI:
         s.simprint_env_combo.pack(side=tk.LEFT, padx=3)
         s.simprint_env_combo.bind("<<ComboboxSelected>>", s._on_simprint_env_select)
 
-        # 控制栏
-        ctrl = tk.Frame(content, bg="#1a1a2e", pady=5)
-        ctrl.pack(fill=tk.X, padx=15)
+        # 代理与运行控制栏
+        ctrl = tk.Frame(browser_network_frame, bg="#1a1a2e", pady=5)
+        ctrl.pack(fill=tk.X, padx=10, pady=(0, 3))
         tk.Label(ctrl, text="代理:", bg="#1a1a2e", fg="#eaeaea").pack(side=tk.LEFT)
         s.proxy_var = tk.StringVar(value=s.cfg["proxy"])
         tk.Entry(
@@ -2340,7 +2547,7 @@ class GUI:
             fg="#00d9ff",
             font=(FONT_FAMILY, 10, "bold"),
         ).pack(anchor=tk.W)
-        s.log = scrolledtext.ScrolledText(
+        s.log = tk.Text(
             right,
             height=14,
             bg="#16213e",
@@ -2349,6 +2556,7 @@ class GUI:
             insertbackground="#eaeaea",
         )
         s.log.pack(fill=tk.BOTH, expand=True, pady=5)
+        s.log.bind("<MouseWheel>", lambda e: s.log.yview_scroll(int(-e.delta / 120), "units"))
         s.log.config(state=tk.DISABLED)
 
         # 参数设置
@@ -2535,7 +2743,7 @@ class GUI:
         stats_inner = tk.Frame(stats_frame, bg="#1a1a2e")
         stats_inner.pack(fill=tk.X, padx=10, pady=5)
 
-        s.stats_topic = tk.StringVar(value="帖子: 0")
+        s.stats_topic = tk.StringVar(value="话题: 0")
         s.stats_floors = tk.StringVar(value="爬楼: 0")
         s.stats_total = tk.StringVar(value="已读: 0")
         s.stats_like = tk.StringVar(value="点赞: 0")
@@ -2594,6 +2802,130 @@ class GUI:
             s.simprint_frame.pack(side=tk.LEFT, padx=5)
         else:
             s.simprint_frame.pack_forget()
+
+    def _bitbrowser_api_params_from_ui(s):
+        try:
+            port = int(s.bit_port_var.get())
+            if port <= 0 or port > 65535:
+                raise ValueError
+        except Exception:
+            port = 54345
+            s.bit_port_var.set(str(port))
+        return port
+
+    def _load_bitbrowser_windows(s, port):
+        """通过比特浏览器本地 API 分页读取窗口列表。"""
+        # BitBrowser 文档规定分页从 0 开始，page=0 才是第一页。
+        page = 0
+        page_size = 100
+        windows = []
+
+        while True:
+            resp = call_bitbrowser_api(
+                port,
+                "/browser/list",
+                {"page": page, "pageSize": page_size},
+                timeout=20,
+            )
+            if (
+                not isinstance(resp, dict)
+                or resp.get("success") is False
+                or resp.get("code") in (0, False)
+            ):
+                message = resp.get("msg") or resp.get("message") if resp else "无响应"
+                raise RuntimeError(message)
+
+            page_windows = extract_bitbrowser_windows(resp)
+            windows.extend(page_windows)
+            data = resp.get("data", {}) or {}
+            if isinstance(data, list):
+                raw_items = data
+                total = resp.get("total")
+            elif isinstance(data, dict):
+                raw_items = next(
+                    (
+                        data.get(key)
+                        for key in (
+                            "list",
+                            "items",
+                            "browserList",
+                            "browser_list",
+                            "windows",
+                            "data",
+                        )
+                        if isinstance(data.get(key), list)
+                    ),
+                    [],
+                )
+                total = data.get("total")
+            else:
+                break
+
+            if isinstance(total, int):
+                if (page + 1) * page_size < total:
+                    page += 1
+                    continue
+                break
+            if len(raw_items) >= page_size:
+                page += 1
+                continue
+            break
+
+        unique = {}
+        for window in windows:
+            unique.setdefault(window["id"], window)
+        return list(unique.values())
+
+    def _on_bitbrowser_fetch_windows(s):
+        port = s._bitbrowser_api_params_from_ui()
+        s.bit_fetch_btn.config(state=tk.DISABLED, text="获取中...")
+
+        def worker():
+            try:
+                windows = s._load_bitbrowser_windows(port)
+                s.rt.after(0, lambda: s._finish_bitbrowser_fetch(windows, None))
+            except Exception as e:
+                s.rt.after(0, lambda error=e: s._finish_bitbrowser_fetch([], error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_bitbrowser_fetch(s, windows, error):
+        s.bit_fetch_btn.config(state=tk.NORMAL, text="获取窗口")
+        if error:
+            messagebox.showerror("错误", f"获取比特浏览器窗口失败：{error}")
+            return
+        if not windows:
+            s.bit_window_options = {}
+            s.bit_window_combo["values"] = []
+            s.bit_window_select_var.set("")
+            s.bit_id_var.set("")
+            s._save_settings()
+            messagebox.showinfo("未找到窗口", "比特浏览器 API 没有返回可用窗口")
+            return
+
+        options = {}
+        values = []
+        for window in windows:
+            label = format_bitbrowser_window_label(window)
+            options[label] = window["id"]
+            values.append(label)
+
+        s.bit_window_options = options
+        s.bit_window_combo["values"] = values
+        selected_id = s.bit_id_var.get().strip()
+        selected_label = next(
+            (label for label, window_id in options.items() if window_id == selected_id),
+            values[0],
+        )
+        s.bit_window_select_var.set(selected_label)
+        s.bit_id_var.set(options[selected_label])
+        s._save_settings()
+
+    def _on_bitbrowser_window_select(s, event=None):
+        window_id = s.bit_window_options.get(s.bit_window_select_var.get())
+        if window_id:
+            s.bit_id_var.set(window_id)
+            s._save_settings()
 
     def _simprint_api_params_from_ui(s):
         try:
@@ -2757,6 +3089,16 @@ class GUI:
                 except:
                     labels["current_var"].set(new_current)
 
+    def _toggle_progress_panel(s):
+        """显示或隐藏整个升级进度区域，保留内部控件以支持后台更新。"""
+        s.progress_expanded = bool(s.progress_expanded_var.get())
+        if s.progress_expanded:
+            s.progress_frame.pack(
+                fill=tk.X, padx=15, pady=5, before=s.progress_insert_before
+            )
+        else:
+            s.progress_frame.pack_forget()
+
     def _build_progress_panel(s, requirements):
         """构建升级进度面板"""
         # 清除旧内容
@@ -2901,7 +3243,7 @@ class GUI:
                 topics = s.bot.stats.get("topic", 0)
                 floors = s.bot.stats.get("floors", 0)
                 total_read = topics + floors
-                s.stats_topic.set(f"帖子: {topics}")
+                s.stats_topic.set(f"话题: {topics}")
                 s.stats_floors.set(f"爬楼: {floors}")
                 s.stats_total.set(f"已读: {total_read}")
                 s.stats_like.set(
@@ -2921,10 +3263,13 @@ class GUI:
             s.cfg["bit_api_port"] = int(s.bit_port_var.get())
         except Exception:
             s.cfg["bit_api_port"] = 54345
+        if s.cfg["browser_backend"] == "bitbrowser":
+            selected_id = s.bit_window_options.get(s.bit_window_select_var.get())
+            if not selected_id:
+                messagebox.showerror("错误", "请先获取并选择比特浏览器窗口")
+                return
+            s.bit_id_var.set(selected_id)
         s.cfg["bit_window_id"] = s.bit_id_var.get().strip()
-        if s.cfg["browser_backend"] == "bitbrowser" and not s.cfg["bit_window_id"]:
-            messagebox.showerror("错误", "请先填写比特浏览器的窗口ID")
-            return
         try:
             s.cfg["simprint_api_port"] = int(s.simprint_port_var.get())
         except Exception:
@@ -3017,6 +3362,7 @@ class GUI:
             enable_reply=enable_reply,
             enable_wait=enable_wait,
             browse_mode=browse_mode,
+            screen_height=s.screen_height,
         )
         s.th = threading.Thread(target=s._run, daemon=True)
         s.th.start()
@@ -3024,6 +3370,9 @@ class GUI:
     def _run(s):
         try:
             s.bot.run_session()
+        except Exception as e:
+            # 后台异常不能直接更新 Tk 控件，交给主线程统一写入日志。
+            s.rt.after(0, lambda error=e: s._lg(f"运行异常: {error}"))
         finally:
             s.rt.after(0, s._done)
 
