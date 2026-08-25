@@ -32,6 +32,12 @@ from linux_do.resources import (
     get_icon_path,
     get_settings_path,
 )
+from linux_do.session_stats import (
+    add_read_progress,
+    add_topic_progress,
+    new_stats,
+    progress_added_for_metric,
+)
 from linux_do.topics import (
     build_get_topics_js,
     count_topic_candidates,
@@ -270,7 +276,7 @@ class Bot:
         s.screen_height = screen_height
         s.pg = None
         s.run = False
-        s.stats = {"topic": 0, "like": 0, "reply": 0, "like_reply": 0, "floors": 0}
+        s.stats = new_stats()
         s.user_info = None
         s.level_requirements = []  # 保存升级要求
         s.initial_level_info = None  # 保存初始等级信息用于对比
@@ -952,7 +958,13 @@ class Bot:
         if total_floors < 10:
             s.lg(f"楼层数太少（{total_floors}），使用快速浏览")
             s._scroll_page_legacy(duration)
-            return max(0, total_floors - start_floor)
+            floors_climbed = max(0, total_floors - start_floor)
+            add_read_progress(s.stats, floors_climbed)
+            if floors_climbed and s.update_progress:
+                s.update_progress(s.stats)
+            if floors_climbed:
+                s._update_countdown_display()
+            return floors_climbed
 
         scroll_count = 0
         current_floor = start_floor
@@ -987,7 +999,7 @@ class Bot:
                 if current_floor > last_floor:
                     # 计算本次爬过的楼层数并累加到统计
                     floors_climbed = current_floor - last_floor
-                    s.stats["floors"] += floors_climbed
+                    add_read_progress(s.stats, floors_climbed)
 
                     s.lg(
                         f"爬楼 #{scroll_count} → 当前: {current_floor}/{total_floors} 楼 (本帖已爬 {current_floor - start_floor} 层)"
@@ -1027,18 +1039,13 @@ class Bot:
         """
         floor_info = s.get_floor_info()
         if not floor_info:
-            s.lg("⚠ 无法获取楼层信息，快速滚动3次")
-            # 快速滚动3次，假设爬了3层
+            s.lg("⚠ 无法获取楼层信息，快速滚动3次（不计入可确认阅读数）")
             for i in range(3):
                 if not s.run:
                     break
                 time.sleep(random.uniform(1, 2))
                 s.pg.run_js(f"window.scrollBy(0, {random.randint(400, 800)})")
-            s.stats["floors"] += 3
-            if s.update_progress:
-                s.update_progress(s.stats)
-            s._update_countdown_display()
-            return 3
+            return 0
 
         total_floors = floor_info["total"]
         start_floor = floor_info["current"]  # 记录开始楼层
@@ -1074,7 +1081,7 @@ class Bot:
                 if current_floor > last_floor:
                     # 计算本次爬过的楼层数并累加
                     floors_climbed = current_floor - last_floor
-                    s.stats["floors"] += floors_climbed
+                    add_read_progress(s.stats, floors_climbed)
                     last_floor = current_floor
 
                     # 实时更新进度和倒计时
@@ -1263,7 +1270,7 @@ class Bot:
             # 所以我们在这里只需要确保页面加载完成即可
             s.lg("话题页面已加载")
 
-            s.stats["topic"] += 1
+            add_topic_progress(s.stats)
 
             # 更新进度
             if s.update_progress:
@@ -1354,20 +1361,14 @@ class Bot:
         elapsed_minutes = int(elapsed_time / 60)
         elapsed_seconds = int(elapsed_time % 60)
 
-        # 根据浏览模式计算已读数
-        if s.browse_mode == "quick":
-            # 快速浏览模式：只计算主题数
-            total_read = s.stats.get("topic", 0)
-            read_desc = f"主题{total_read}"
-        else:
-            # 深度爬楼模式：计算主题+楼层
-            topics = s.stats.get("topic", 0)
-            floors = s.stats.get("floors", 0)
-            total_read = topics + floors
-            read_desc = f"帖{topics}+楼{floors}"
+        topics = s.stats.get("topic", 0)
+        floors = s.stats.get("floors", 0)
+        total_read = s.stats.get("posts_read", topics + floors)
+        read_desc = f"话题{topics}+楼{floors}"
+        progress_value = topics if s.browse_mode == "quick" else total_read
 
         if s.mode == "topics":
-            remaining = s.target_value - total_read
+            remaining = s.target_value - progress_value
             text = f"剩余: {remaining} | 已读: {total_read} ({read_desc}) | 用时: {elapsed_minutes}:{elapsed_seconds:02d}"
         elif s.mode == "time":
             elapsed_secs = elapsed_time
@@ -1391,7 +1392,9 @@ class Bot:
                 return s.stats.get("topic", 0) >= s.target_value
             else:
                 # 深度爬楼模式：计算主题+楼层
-                total_read = s.stats.get("topic", 0) + s.stats.get("floors", 0)
+                total_read = s.stats.get(
+                    "posts_read", s.stats.get("topic", 0) + s.stats.get("floors", 0)
+                )
                 return total_read >= s.target_value
         elif s.mode == "time":
             if s.start_time:
@@ -1444,7 +1447,7 @@ class Bot:
 
     def run_session(s):
         s.run = True
-        s.stats = {"topic": 0, "like": 0, "reply": 0, "like_reply": 0, "floors": 0}
+        s.stats = new_stats()
         s.start_time = time.time()  # 记录开始时间
 
         if not s.start():
@@ -1508,11 +1511,12 @@ class Bot:
                                 f"已达到目标主题数: {s.stats.get('topic', 0)}/{s.target_value}"
                             )
                         else:
-                            total_read = s.stats.get("topic", 0) + s.stats.get(
-                                "floors", 0
+                            total_read = s.stats.get(
+                                "posts_read",
+                                s.stats.get("topic", 0) + s.stats.get("floors", 0),
                             )
                             s.lg(
-                                f"已达到目标已读数: {total_read}/{s.target_value} (帖子{s.stats['topic']}+爬楼{s.stats.get('floors', 0)})"
+                                f"已达到目标已读数: {total_read}/{s.target_value} (话题{s.stats['topic']}+爬楼{s.stats.get('floors', 0)})"
                             )
                         s.run = False
                         break
@@ -1526,11 +1530,12 @@ class Bot:
                                 f"已达到目标主题数: {s.stats.get('topic', 0)}/{s.target_value}"
                             )
                         else:
-                            total_read = s.stats.get("topic", 0) + s.stats.get(
-                                "floors", 0
+                            total_read = s.stats.get(
+                                "posts_read",
+                                s.stats.get("topic", 0) + s.stats.get("floors", 0),
                             )
                             s.lg(
-                                f"已达到目标已读数: {total_read}/{s.target_value} (帖子{s.stats['topic']}+爬楼{s.stats.get('floors', 0)})"
+                                f"已达到目标已读数: {total_read}/{s.target_value} (话题{s.stats['topic']}+爬楼{s.stats.get('floors', 0)})"
                             )
                         s.run = False
                         break
@@ -1543,11 +1548,14 @@ class Bot:
                                 f"📊 进度: {s.stats.get('topic', 0)}/{s.target_value} 主题 (剩余 {remaining})"
                             )
                     else:
-                        total_read = s.stats.get("topic", 0) + s.stats.get("floors", 0)
+                        total_read = s.stats.get(
+                            "posts_read",
+                            s.stats.get("topic", 0) + s.stats.get("floors", 0),
+                        )
                         if s.mode == "topics":
                             remaining = s.target_value - total_read
                             s.lg(
-                                f"📊 进度: {total_read}/{s.target_value} (帖子{s.stats['topic']}+爬楼{s.stats.get('floors', 0)}) 剩余 {remaining}"
+                                f"📊 进度: {total_read}/{s.target_value} (话题{s.stats['topic']}+爬楼{s.stats.get('floors', 0)}) 剩余 {remaining}"
                             )
 
                     if s.mode == "time":
@@ -1580,13 +1588,16 @@ class Bot:
             elapsed_seconds = int(elapsed_time % 60)
 
             # 计算已读总数
-            total_read = s.stats.get("topic", 0) + s.stats.get("floors", 0)
+            total_read = s.stats.get(
+                "posts_read", s.stats.get("topic", 0) + s.stats.get("floors", 0)
+            )
 
             s.lg("=" * 30)
             s.lg("完成!")
-            s.lg(f"浏览帖子: {s.stats['topic']}")
+            s.lg(f"浏览话题: {s.stats['topic']}")
+            s.lg(f"浏览帖子: {s.stats.get('posts_read', total_read)}")
             s.lg(f"爬楼总数: {s.stats.get('floors', 0)} 楼")
-            s.lg(f"已读总计: {total_read} (帖子+爬楼)")
+            s.lg(f"已读总计: {total_read} (话题+爬楼)")
             s.lg(f"点赞主帖: {s.stats['like']}")
             s.lg(f"点赞回复: {s.stats['like_reply']}")
             s.lg(f"回帖数量: {s.stats['reply']}")
@@ -1942,7 +1953,10 @@ class GUI:
             elapsed_seconds = int(elapsed_time % 60)
 
             # 计算已读总数
-            total_read = s.bot.stats.get("topic", 0) + s.bot.stats.get("floors", 0)
+            total_read = s.bot.stats.get(
+                "posts_read",
+                s.bot.stats.get("topic", 0) + s.bot.stats.get("floors", 0),
+            )
 
             # 显示模式
             if s.bot.mode == "topics":
@@ -1964,8 +1978,10 @@ class GUI:
             tooltip += f"用时: {elapsed_minutes}:{elapsed_seconds:02d}\n"
 
         if stats:
-            total_read = stats.get("topic", 0) + stats.get("floors", 0)
-            tooltip += f"已读: {total_read} (帖{stats.get('topic', 0)}+楼{stats.get('floors', 0)}) | "
+            total_read = stats.get(
+                "posts_read", stats.get("topic", 0) + stats.get("floors", 0)
+            )
+            tooltip += f"已读: {total_read} (话题{stats.get('topic', 0)}+楼{stats.get('floors', 0)}) | "
             tooltip += f"点赞: {stats.get('like', 0) + stats.get('like_reply', 0)} | "
             tooltip += f"回复: {stats.get('reply', 0)}"
 
@@ -3201,14 +3217,10 @@ class GUI:
                     initial = int(labels["initial"].replace(",", ""))
                     added = 0
 
-                    # 根据指标名匹配统计
-                    name_lower = name.lower()
-                    if "浏览" in name or "阅读" in name or "话题" in name:
-                        added = stats.get("topic", 0)
-                    elif "点赞" in name or "赞" in name:
-                        added = stats.get("like", 0) + stats.get("like_reply", 0)
-                    elif "回复" in name or "发帖" in name:
-                        added = stats.get("reply", 0)
+                    # 按具体指标映射统计，避免浏览话题和浏览帖子共用一个值。
+                    added = progress_added_for_metric(name, stats)
+                    if added is None:
+                        continue
 
                     if added > 0:
                         new_val = initial + added
@@ -3242,7 +3254,7 @@ class GUI:
             if s.bot:
                 topics = s.bot.stats.get("topic", 0)
                 floors = s.bot.stats.get("floors", 0)
-                total_read = topics + floors
+                total_read = s.bot.stats.get("posts_read", topics + floors)
                 s.stats_topic.set(f"话题: {topics}")
                 s.stats_floors.set(f"爬楼: {floors}")
                 s.stats_total.set(f"已读: {total_read}")
