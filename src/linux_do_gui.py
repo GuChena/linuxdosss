@@ -83,6 +83,11 @@ CATS = default_categories()
 CFG = default_config()
 
 
+def info_display_text(value):
+    """缺失的信息统一显示为短横线，保留有效的零值。"""
+    return "-" if value is None else str(value).strip() or "-"
+
+
 def call_simprint_api(port, api_key, path, payload=None, timeout=60):
     """调用 Simprint 本地 API（POST JSON）。"""
     url = f"http://127.0.0.1:{port}/api/local{path}"
@@ -779,22 +784,23 @@ class Bot:
             return getLevelInfo();
             """)
 
-            if info:
+            if isinstance(info, dict) and info:
                 s.user_info = info
-                s.lg("用户: " + info.get("username", "未知"))
-                s.lg("当前等级: " + info.get("level", "未知") + "级")
+                s.lg("用户: " + info_display_text(info.get("username")))
+                level = info_display_text(info.get("level"))
+                s.lg("当前等级: " + (level + "级" if level != "-" else "-"))
                 if info.get("nextLevel"):
-                    s.lg("下一级: " + info.get("nextLevel") + "级")
+                    s.lg("下一级: " + info_display_text(info.get("nextLevel")) + "级")
                 if info.get("requirements"):
                     s.lg("升级要求:")
                     for req in info["requirements"][:8]:
                         s.lg(
                             "  "
-                            + req["name"]
+                            + info_display_text(req.get("name"))
                             + ": "
-                            + req["current"]
+                            + info_display_text(req.get("current"))
                             + "/"
-                            + req["required"]
+                            + info_display_text(req.get("required"))
                         )
 
                 # 更新GUI显示
@@ -811,6 +817,10 @@ class Bot:
                 return info
         except Exception as e:
             s.lg("获取等级失败: " + str(e))
+        s.user_info = None
+        s.level_requirements = []
+        if s.update_info:
+            s.update_info(None, is_final)
         return None
 
     def get_topics(s, cat):
@@ -1643,19 +1653,19 @@ class Bot:
                     s.lg("-" * 30)
                     initial_reqs = {
                         r["name"]: r
-                        for r in s.initial_level_info.get("requirements", [])
+                        for r in s.initial_level_info.get("requirements", []) or []
                     }
                     final_reqs = {
-                        r["name"]: r for r in final_info.get("requirements", [])
+                        r["name"]: r for r in final_info.get("requirements", []) or []
                     }
 
                     for name, final_req in final_reqs.items():
                         if name in initial_reqs:
+                            initial_text = info_display_text(initial_reqs[name].get("current"))
+                            final_text = info_display_text(final_req.get("current"))
                             try:
-                                initial_val = int(
-                                    initial_reqs[name]["current"].replace(",", "")
-                                )
-                                final_val = int(final_req["current"].replace(",", ""))
+                                initial_val = int(initial_text.replace(",", ""))
+                                final_val = int(final_text.replace(",", ""))
                                 change = final_val - initial_val
                                 change_str = (
                                     f"+{change}" if change >= 0 else str(change)
@@ -1663,10 +1673,8 @@ class Bot:
                                 s.lg(
                                     f"  {name}: {initial_val} → {final_val} ({change_str})"
                                 )
-                            except:
-                                s.lg(
-                                    f"  {name}: {initial_reqs[name]['current']} → {final_req['current']}"
-                                )
+                            except ValueError:
+                                s.lg(f"  {name}: {initial_text} → {final_text}")
                     s.lg("-" * 30)
 
                 s.lg("=" * 30)
@@ -1728,6 +1736,7 @@ class GUI:
         s._running_status = "就绪"
 
         s._ui()
+        s._reset_info_display()
 
         # 应用上次保存的配置
         s._apply_settings(s._load_settings())
@@ -2173,9 +2182,9 @@ class GUI:
         info_inner = tk.Frame(info_frame, bg="#1a1a2e")
         info_inner.pack(fill=tk.X, padx=10, pady=5)
 
-        s.user_label = tk.StringVar(value="用户: 未登录")
-        s.level_label = tk.StringVar(value="等级: -")
-        s.next_level_label = tk.StringVar(value="下一级: -")
+        s.user_label = tk.StringVar(master=info_inner, value="用户: -")
+        s.level_label = tk.StringVar(master=info_inner, value="等级: -")
+        s.next_level_label = tk.StringVar(master=info_inner, value="下一级: -")
 
         tk.Label(
             info_inner,
@@ -3179,52 +3188,53 @@ class GUI:
                 # 用户取消，恢复为未选中状态
                 s.enable_reply_var.set(False)
 
+    def _reset_info_display(s):
+        """在主线程清空上一轮信息，防止缺失数据沿用旧值。"""
+        s.user_label.set("用户: -")
+        s.level_label.set("等级: -")
+        s.next_level_label.set("下一级: -")
+        s.initial_requirements = []
+        s._progress_estimates_enabled = False
+        s._build_progress_panel([])
+
     def _update_info(s, info, is_final=False):
         """更新用户信息显示"""
+        info = info if isinstance(info, dict) else {}
 
         def update():
-            if info.get("username"):
-                s.user_label.set("用户: " + info["username"])
-            if info.get("level"):
-                s.level_label.set("等级: " + info["level"] + "级")
-            if info.get("nextLevel"):
-                s.next_level_label.set("下一级: " + info["nextLevel"] + "级")
+            s.user_label.set("用户: " + info_display_text(info.get("username")))
+            level = info_display_text(info.get("level"))
+            next_level = info_display_text(info.get("nextLevel"))
+            s.level_label.set("等级: " + (level + "级" if level != "-" else "-"))
+            s.next_level_label.set("下一级: " + (next_level + "级" if next_level != "-" else "-"))
 
             # 更新升级进度面板
-            requirements = info.get("requirements", [])
-            if requirements:
-                if not s.initial_requirements:
-                    # 首次获取，保存初始值
-                    s.initial_requirements = requirements.copy()
-                    s._build_progress_panel(requirements)
-                elif is_final:
-                    # 结束时更新，显示实际变化
-                    s._update_final_progress(requirements)
+            requirements = [
+                req for req in info.get("requirements", []) or []
+                if isinstance(req, dict) and info_display_text(req.get("name")) != "-"
+            ]
+            s._progress_estimates_enabled = bool(requirements) and not is_final
+            if not requirements:
+                s.initial_requirements = []
+                s._build_progress_panel([])
+            elif is_final:
+                s._update_final_progress(requirements)
+            else:
+                s.initial_requirements = deepcopy(requirements)
+                s._build_progress_panel(requirements)
 
         s.rt.after(0, update)
 
     def _update_final_progress(s, new_requirements):
         """结束时更新进度面板，显示实际变化"""
-        for new_req in new_requirements:
-            name = new_req.get("name", "")
-            new_current = new_req.get("current", "0")
-
-            if name in s.req_labels:
-                labels = s.req_labels[name]
-                try:
-                    initial = int(labels["initial"].replace(",", ""))
-                    new_val = int(new_current.replace(",", ""))
-                    actual_added = new_val - initial
-
-                    labels["current_var"].set(new_current)
-                    if actual_added > 0:
-                        labels["added_var"].set(f"+{actual_added}")
-                    elif actual_added < 0:
-                        labels["added_var"].set(str(actual_added))
-                    else:
-                        labels["added_var"].set("+0")
-                except:
-                    labels["current_var"].set(new_current)
+        latest = {req["name"]: req for req in new_requirements}
+        initial_names = {req["name"] for req in s.initial_requirements}
+        requirements = [
+            latest.get(req["name"], {"name": req["name"]})
+            for req in s.initial_requirements
+        ]
+        requirements.extend(req for req in new_requirements if req["name"] not in initial_names)
+        s._build_progress_panel(requirements, is_final=True)
 
     def _toggle_progress_panel(s):
         """显示或隐藏整个升级进度区域，保留内部控件以支持后台更新。"""
@@ -3236,7 +3246,7 @@ class GUI:
         else:
             s.progress_frame.pack_forget()
 
-    def _build_progress_panel(s, requirements):
+    def _build_progress_panel(s, requirements, is_final=False):
         """构建升级进度面板"""
         # 清除旧内容
         for widget in s.progress_inner.winfo_children():
@@ -3260,11 +3270,27 @@ class GUI:
                 anchor="w",
             ).grid(row=0, column=col, padx=col_padx[col], pady=5, sticky="w")
 
+        if not requirements:
+            for col in range(len(headers)):
+                tk.Label(
+                    s.progress_inner, text="-", bg="#1a1a2e", fg="#888888",
+                    font=(FONT_FAMILY, 9), anchor="w",
+                ).grid(row=1, column=col, padx=col_padx[col], pady=3, sticky="w")
+            return
+
+        initial_by_name = {req["name"]: req for req in s.initial_requirements}
         # 创建数据行
         for row, req in enumerate(requirements[:8], start=1):
             name = req.get("name", "")
-            current = req.get("current", "0")
-            required = req.get("required", "0")
+            current = info_display_text(req.get("current"))
+            required = info_display_text(req.get("required"))
+            initial_req = initial_by_name.get(name, {}) if is_final else req
+            initial = info_display_text(initial_req.get("current"))
+            added = "-"
+            try:
+                added = f"{int(current.replace(',', '')) - int(initial.replace(',', '')):+d}"
+            except ValueError:
+                pass
 
             # 指标名
             tk.Label(
@@ -3279,7 +3305,7 @@ class GUI:
             # 初始值
             tk.Label(
                 s.progress_inner,
-                text=current,
+                text=initial,
                 bg="#1a1a2e",
                 fg="#888888",
                 font=(FONT_FAMILY, 9),
@@ -3287,7 +3313,7 @@ class GUI:
             ).grid(row=row, column=1, padx=col_padx[1], pady=3, sticky="w")
 
             # 当前值（可更新）
-            current_var = tk.StringVar(value=current)
+            current_var = tk.StringVar(master=s.progress_inner, value=current)
             tk.Label(
                 s.progress_inner,
                 textvariable=current_var,
@@ -3308,7 +3334,7 @@ class GUI:
             ).grid(row=row, column=3, padx=col_padx[3], pady=3, sticky="w")
 
             # 本次增加
-            added_var = tk.StringVar(value="+0")
+            added_var = tk.StringVar(master=s.progress_inner, value=added)
             tk.Label(
                 s.progress_inner,
                 textvariable=added_var,
@@ -3320,7 +3346,7 @@ class GUI:
 
             # 保存引用
             s.req_labels[name] = {
-                "initial": current,
+                "initial": initial,
                 "current_var": current_var,
                 "added_var": added_var,
             }
@@ -3329,7 +3355,7 @@ class GUI:
         """根据统计更新进度显示"""
 
         def update():
-            if not s.req_labels:
+            if not s._progress_estimates_enabled or not s.req_labels:
                 return
 
             # 根据统计数据更新相关指标
@@ -3503,7 +3529,7 @@ class GUI:
         key = task_key(backend, environment_id)
         if not s.task_registry.begin(key):
             return False
-        s.initial_requirements = []
+        s._reset_info_display()
         s.status.set("运行中...")
         s._update_tray_status("运行中")
         s._refresh_task_tables()

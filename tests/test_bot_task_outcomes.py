@@ -127,6 +127,22 @@ class BotTaskOutcomeTests(unittest.TestCase):
         self.bot.lg.assert_any_call("获取等级失败: site unavailable")
         self.bot.close.assert_called_once()
 
+    def test_missing_level_info_notifies_gui_to_clear_old_values(self):
+        for is_final in (False, True):
+            for failure in ("empty", "exception"):
+                with self.subTest(is_final=is_final, failure=failure):
+                    self.bot.user_info = {"username": "old-user"}
+                    self.bot.level_requirements = [{"name": "浏览帖子", "current": "100"}]
+                    self.bot.update_info = Mock()
+                    self.bot.pg.run_js.return_value = None
+                    self.bot.pg.get.side_effect = RuntimeError("site unavailable") if failure == "exception" else None
+                    with patch.object(self.module.time, "sleep"):
+                        result = self.module.Bot.get_level_info(self.bot, is_final=is_final)
+                    self.assertIsNone(result)
+                    self.bot.update_info.assert_called_once_with(None, is_final)
+                    self.assertIsNone(self.bot.user_info)
+                    self.assertEqual(self.bot.level_requirements, [])
+
     def test_browser_is_closed_when_browsing_raises(self):
         self.bot.browse_cat = Mock(side_effect=RuntimeError("browser disconnected"))
         with self.assertRaises(RuntimeError):

@@ -5,7 +5,7 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_gui_reply_filter import load_gui_module
 
@@ -61,6 +61,21 @@ class BrowserTaskGuiTests(unittest.TestCase):
     def finish_worker(self, outcome):
         self.gui.th.alive = False
         self.gui._done(self.gui.bot, self.gui.task_registry.active_key, outcome)
+
+    def progress_row_values(self, row):
+        values = []
+        for column in range(5):
+            label = self.gui.progress_inner.grid_slaves(row=row, column=column)[0]
+            variable = label.cget("textvariable")
+            values.append(self.root.getvar(variable) if variable else label.cget("text"))
+        return values
+
+    def assert_unknown_info(self):
+        self.assertEqual(self.gui.user_label.get(), "用户: -")
+        self.assertEqual(self.gui.level_label.get(), "等级: -")
+        self.assertEqual(self.gui.next_level_label.get(), "下一级: -")
+        self.assertEqual(self.progress_row_values(1), ["-"] * 5)
+        self.assertEqual(len(self.gui.progress_inner.winfo_children()), 10)
 
     def refresh_layout(self, container):
         # Hidden test windows need their geometry managers invoked explicitly.
@@ -194,6 +209,108 @@ class BrowserTaskGuiTests(unittest.TestCase):
                     ), values)
                 self.assertEqual(self.gui.initial_requirements, initial_requirements)
                 self.assertFalse(self.gui.task_registry.busy)
+
+    def test_starting_another_environment_or_restarting_clears_previous_info(self):
+        self.assert_unknown_info()
+        for environment_id in ("sim-a", "sim-b", "sim-b"):
+            with self.subTest(environment=environment_id):
+                self.assertTrue(self.gui._start_browser_task("simprint", environment_id))
+                self.assert_unknown_info()
+                self.gui._update_progress({"posts_read": 20})
+                self.root.update()
+                self.assert_unknown_info()
+                self.gui._update_info({
+                    "username": environment_id, "level": "1", "nextLevel": "2",
+                    "requirements": [
+                        {"name": "浏览帖子", "current": "100", "required": "600"},
+                    ],
+                })
+                self.root.update()
+                self.assertEqual(self.gui.user_label.get(), "用户: " + environment_id)
+                self.assertEqual(self.progress_row_values(1), ["浏览帖子", "100", "100", "600", "+0"])
+                self.finish_worker(self.module.STOPPED)
+
+    def test_missing_info_clears_old_values_and_does_not_resume_estimates(self):
+        for is_final in (False, True):
+            for missing in (None, {}, {"username": "", "level": None, "nextLevel": " ", "requirements": []}):
+                with self.subTest(is_final=is_final, missing=missing):
+                    self.gui._update_info({
+                        "username": "old-user", "level": "1", "nextLevel": "2",
+                        "requirements": [
+                            {"name": "浏览帖子", "current": "100", "required": "600"},
+                        ],
+                    })
+                    self.gui._update_progress({"posts_read": 20})
+                    self.root.update()
+                    self.assertEqual(self.progress_row_values(1)[2], "120")
+                    self.gui._update_info(missing, is_final=is_final)
+                    self.root.update()
+                    self.assert_unknown_info()
+                    self.gui._update_progress({"posts_read": 30})
+                    self.root.update()
+                    self.assert_unknown_info()
+
+    def test_partial_info_clears_missing_fields_and_preserves_zero_values(self):
+        self.assertTrue(self.gui._start_browser_task("simprint", "sim-a"))
+        self.gui._update_info({"username": "old-user", "level": "2", "nextLevel": "3"})
+        self.root.update()
+        self.gui.bot.pg = Mock()
+        self.gui.bot.pg.run_js.return_value = {
+            "username": "new-user", "level": 0,
+            "requirements": [
+                {"name": "浏览帖子", "current": 0},
+                {"name": "给出的赞", "current": " ", "required": "30"},
+            ],
+        }
+        with patch.object(self.module.time, "sleep"):
+            self.gui.bot.get_level_info()
+        self.root.update()
+        self.assertEqual(self.gui.user_label.get(), "用户: new-user")
+        self.assertEqual(self.gui.level_label.get(), "等级: 0级")
+        self.assertEqual(self.gui.next_level_label.get(), "下一级: -")
+        self.assertEqual(self.progress_row_values(1), ["浏览帖子", "0", "0", "-", "+0"])
+        self.assertEqual(self.progress_row_values(2), ["给出的赞", "-", "-", "30", "-"])
+        self.gui._update_progress({"posts_read": 2, "like": 3})
+        self.root.update()
+        self.assertEqual(self.progress_row_values(1), ["浏览帖子", "0", "2", "-", "+2"])
+        self.assertEqual(self.progress_row_values(2), ["给出的赞", "-", "-", "30", "-"])
+
+    def test_final_fetch_clears_missing_metrics_and_fields(self):
+        self.gui._update_info({
+            "requirements": [
+                {"name": "浏览帖子", "current": "100", "required": "600"},
+                {"name": "给出的赞", "current": "10", "required": "30"},
+            ],
+        })
+        self.gui._update_progress({"posts_read": 20, "like": 3})
+        self.root.update()
+        self.gui._update_info({
+            "requirements": [
+                {"name": "浏览帖子", "current": None, "required": "6,000"},
+                {"name": "回复帖子", "current": "3", "required": "5"},
+            ],
+        }, is_final=True)
+        self.gui._update_progress({"posts_read": 30, "like": 4, "reply": 2})
+        self.root.update()
+        self.assertEqual(self.progress_row_values(1), ["浏览帖子", "100", "-", "6,000", "-"])
+        self.assertEqual(self.progress_row_values(2), ["给出的赞", "10", "-", "-", "-"])
+        self.assertEqual(self.progress_row_values(3), ["回复帖子", "-", "3", "5", "-"])
+
+    def test_final_only_fetch_leaves_initial_value_and_difference_unknown(self):
+        self.gui._update_info(None)
+        self.root.update()
+        self.gui._update_info({
+            "username": "current-user", "level": "1", "nextLevel": "2",
+            "requirements": [
+                {"name": "浏览帖子", "current": "112", "required": "600"},
+            ],
+        }, is_final=True)
+        self.root.update()
+        self.assertEqual(self.gui.user_label.get(), "用户: current-user")
+        self.assertEqual(self.progress_row_values(1), ["浏览帖子", "-", "112", "600", "-"])
+        self.gui._update_progress({"posts_read": 20})
+        self.root.update()
+        self.assertEqual(self.progress_row_values(1), ["浏览帖子", "-", "112", "600", "-"])
 
     def test_refresh_keeps_the_running_row_and_its_stop_action(self):
         self.gui._start_browser_task("simprint", "sim-a")
